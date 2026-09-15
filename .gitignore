@@ -1,6 +1,0 @@
-*.o
-*.elf
-*.cdi
-*.gdi
-romdisk.img
-romdisk.o
