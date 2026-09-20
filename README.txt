@@ -87,12 +87,12 @@ TUNING BEHAVIOUR (via config.cfg, or edit mediaplayer.lua SECTION 2 directly)
   LOCK_KEYS           = false   true = ignore keys while media plays
   KEY_CANCEL          = false   true = same key again cancels media
   CLIPS_PER_TRIGGER   = 1       clips per keypress (0 = infinite)
-  SECONDS_PER_TRIGGER = 0       seconds per keypress (0 = use clip count)
-  CUTSCENE_ON_TRIGGER = false   play intro before media
-  CUTSCENE_ON_RETURN  = false   play outro after media
-  CUTSCENE_ON_SWITCH  = false   play transition on loop switch
+  SECONDS_PER_TRIGGER = 0       seconds per keypress (0 = use clip count; if both
+                                are set, SECONDS_PER_TRIGGER wins)
+  CUTSCENE_ON_TRIGGER = true    play intro before media
+  CUTSCENE_ON_RETURN  = true    play outro after media
+  CUTSCENE_ON_SWITCH  = true    play transition on loop switch
   LOOP_MUTED          = true    mute audio during loop playback
-  FADE_DURATION       = 0.5     fade length in seconds
 
 PER-MODE OVERRIDES (via config.cfg, or edit SECTION 3 in mediaplayer.lua)
 --------------------------------------------------------------------------

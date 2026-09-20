@@ -191,10 +191,14 @@ local STATE = {
     pending_media       = nil,  -- deferred media trigger from scheduler
 
     media_timer         = nil,  -- handle for SECONDS_PER_TRIGGER timeout
+    media_seconds_active = false, -- true while a seconds-based timer owns the current trigger
+                                   -- (clip-count limit is ignored until it fires)
     clips_played        = 0,    -- clips played in current media trigger
     active_trigger_key  = nil,  -- key that triggered current media (key_cancel logic)
 
-    schedule_layers     = {},   -- parsed schedule events (index = file line = priority)
+    -- Parsed schedule events, in file order — that order IS the priority
+    -- (see SECTION 15): later entries overwrite earlier matches.
+    schedule_layers     = {},
     _initialised        = false,
 }
 
@@ -429,8 +433,11 @@ local function scan_root()
         -- Loop folders: start with L followed by one or more digits
         -- e.g. "L0", "L1", "L12 - Christmas"
         -- ---------------------------------------------------------------
+        local matched = false
+
         local loop_num = id:match("^L(%d+)$")
         if loop_num then
+            matched = true
             local loop_id = "L" .. loop_num
             MODES.loops[loop_id] = {
                 id    = loop_id,
@@ -447,6 +454,7 @@ local function scan_root()
         -- ---------------------------------------------------------------
         local media_char = id:match("^M([%d%l])$")
         if media_char then
+            matched = true
             local media_id = "M" .. media_char
             MODES.media[media_id] = {
                 id    = media_id,
@@ -463,6 +471,7 @@ local function scan_root()
         -- ---------------------------------------------------------------
         local ov_loop, ov_media = id:match("^(L%d+)(M[%d%l])$")
         if ov_loop and ov_media then
+            matched = true
             local ov_id = ov_loop .. ov_media
             MODES.overrides[ov_id] = {
                 id        = ov_id,
@@ -475,7 +484,13 @@ local function scan_root()
         end
 
         -- Cutscene folders (Intro, Outro, Transition + variants) are resolved
-        -- dynamically in Section 9 — no pre-registration needed.
+        -- dynamically in Section 9 — no pre-registration needed, and they
+        -- intentionally don't start with L/M so they never hit the warning
+        -- below.
+        if not matched and id:match("^[LM]") then
+            warn("Folder '" .. name .. "' starts with L/M but doesn't match a known " ..
+                 "naming pattern (Ln, Mx, or LnMx) — ignoring it. See README.txt.")
+        end
     end
 end
 
@@ -490,9 +505,26 @@ local handle_media_key
 local handle_loop_key
 
 local function register_keybinds()
-    -- Media keybinds: character after M becomes the key
+    -- Media keybinds: character after M becomes the key.
+    --
+    -- Bind every media ID that exists EITHER as a default M-folder OR as
+    -- at least one loop-specific override (e.g. only "L1M2" exists, no
+    -- plain "M2"). The key is bound unconditionally, but handle_media_key
+    -- / resolve_media_folder already only resolve a folder for the
+    -- *current* loop, so pressing the key while no loop-appropriate
+    -- folder exists for it is already a correct no-op — this just makes
+    -- sure override-only modes get a key bound at all.
+    local media_keys = {}
     for media_id, info in pairs(MODES.media) do
-        local key = info.char  -- e.g. "1", "2", "a", "b"
+        media_keys[media_id] = info.char
+    end
+    for _, ov in pairs(MODES.overrides) do
+        if not media_keys[ov.media_id] then
+            media_keys[ov.media_id] = ov.media_id:sub(2)  -- "M2" -> "2"
+        end
+    end
+
+    for media_id, key in pairs(media_keys) do
         local mid = media_id   -- capture for closure
         mp.add_key_binding(key, "media_" .. mid, function()
             handle_media_key(mid, key)
@@ -668,6 +700,7 @@ end
 
 -- Forward declarations
 local play_loop, play_media, play_cutscene, return_to_loop, switch_loop
+local play_media_clip, start_media_trigger
 
 play_loop = function()
     STATE.phase             = "loop"
@@ -713,46 +746,17 @@ play_cutscene = function(folder, on_done)
     mp.commandv("loadfile", file.path, "replace")
 end
 
-play_media = function(media_id, trigger_key)
+-- Loads the next clip for an *already active* media trigger. Does not touch
+-- phase/counters/timer/trigger_key or check for an intro cutscene — used
+-- both for a trigger's first clip and for every subsequent clip in a
+-- multi-clip trigger, so those don't get reset or re-run mid-trigger.
+play_media_clip = function(media_id)
     local folder = resolve_media_folder(media_id)
     if not folder then
-        log("No folder for media: " .. media_id .. " — ignoring")
+        warn("No folder for media: " .. media_id)
+        return_to_loop()
         return
     end
-
-    -- Check for intro cutscene (skip if we are already inside a cutscene chain)
-    local play_intro = mcfg(media_id, "cutscene_on_trigger")
-    if play_intro == nil then play_intro = CONFIG.CUTSCENE_ON_TRIGGER end
-
-    if play_intro and not STATE.in_cutscene then
-        local cf = resolve_cutscene("Intro", STATE.current_loop, media_id)
-        if cf then
-            play_cutscene(cf, function()
-                play_media(media_id, trigger_key)
-            end)
-            return
-        end
-    end
-
-    -- Update state
-    STATE.phase              = "media"
-    STATE.current_media      = media_id
-    STATE.clips_played       = 0
-    STATE.active_trigger_key = trigger_key
-    STATE.in_cutscene        = false
-
-    -- Start seconds timer if configured
-    local seconds = mcfg(media_id, "seconds_per_trigger") or CONFIG.SECONDS_PER_TRIGGER
-    if seconds and seconds > 0 then
-        if STATE.media_timer then STATE.media_timer:kill() end
-        STATE.media_timer = mp.add_timeout(seconds, function()
-            log("Media timed out (" .. seconds .. "s)")
-            STATE.media_timer = nil
-            return_to_loop()
-        end)
-    end
-
-    mp.set_property_bool("mute", false)
 
     local order = mcfg(media_id, "order") or CONFIG.DEFAULT_ORDER
     local file  = next_file(folder, order)
@@ -766,12 +770,76 @@ play_media = function(media_id, trigger_key)
     mp.commandv("loadfile", file.path, "replace")
 end
 
+-- Starts a brand-new media trigger: resets per-trigger state, arms the
+-- optional seconds timer, then plays the first clip. Called once per
+-- trigger (after any intro cutscene has finished) — never per-clip.
+start_media_trigger = function(media_id, trigger_key)
+    STATE.phase                = "media"
+    STATE.current_media        = media_id
+    STATE.clips_played         = 0
+    STATE.active_trigger_key   = trigger_key
+    STATE.in_cutscene          = false
+    STATE.media_seconds_active = false
+
+    if STATE.media_timer then
+        STATE.media_timer:kill()
+        STATE.media_timer = nil
+    end
+
+    -- SECONDS_PER_TRIGGER takes precedence over CLIPS_PER_TRIGGER when both
+    -- are set: while this timer is armed, on_clip_end (SECTION 13) ignores
+    -- the clip-count limit entirely and just keeps playing clips until the
+    -- timer fires.
+    local seconds = mcfg(media_id, "seconds_per_trigger") or CONFIG.SECONDS_PER_TRIGGER
+    if seconds and seconds > 0 then
+        STATE.media_seconds_active = true
+        STATE.media_timer = mp.add_timeout(seconds, function()
+            log("Media timed out (" .. seconds .. "s)")
+            STATE.media_timer          = nil
+            STATE.media_seconds_active = false
+            return_to_loop()
+        end)
+    end
+
+    mp.set_property_bool("mute", false)
+    play_media_clip(media_id)
+end
+
+play_media = function(media_id, trigger_key)
+    local folder = resolve_media_folder(media_id)
+    if not folder then
+        log("No folder for media: " .. media_id .. " — ignoring")
+        return
+    end
+
+    -- Check for intro cutscene (skip if we are already inside a cutscene chain).
+    -- IMPORTANT: the callback below calls start_media_trigger(), not
+    -- play_media() itself — calling play_media() again here would re-check
+    -- (and replay) the intro forever, since STATE.in_cutscene is already
+    -- back to false by the time this callback runs.
+    local play_intro = mcfg(media_id, "cutscene_on_trigger")
+    if play_intro == nil then play_intro = CONFIG.CUTSCENE_ON_TRIGGER end
+
+    if play_intro and not STATE.in_cutscene then
+        local cf = resolve_cutscene("Intro", STATE.current_loop, media_id)
+        if cf then
+            play_cutscene(cf, function()
+                start_media_trigger(media_id, trigger_key)
+            end)
+            return
+        end
+    end
+
+    start_media_trigger(media_id, trigger_key)
+end
+
 return_to_loop = function()
     -- Cancel any running seconds timer
     if STATE.media_timer then
         STATE.media_timer:kill()
         STATE.media_timer = nil
     end
+    STATE.media_seconds_active = false
 
     -- If scheduler posted a loop switch while media was playing, apply it now
     if STATE.pending_loop then
@@ -857,19 +925,28 @@ local function on_clip_end(event)
 
     -- Media mode: decide whether to play another clip or return to loop
     if STATE.phase == "media" then
-        local media_id  = STATE.current_media
-        local clips_max = mcfg(media_id, "clips_per_trigger") or CONFIG.CLIPS_PER_TRIGGER
+        local media_id = STATE.current_media
 
         STATE.clips_played = STATE.clips_played + 1
 
+        -- SECONDS_PER_TRIGGER takes precedence: while its timer is armed,
+        -- ignore the clip-count limit entirely and just keep playing clips
+        -- until the timer fires (see start_media_trigger, SECTION 12).
+        if STATE.media_seconds_active then
+            play_media_clip(media_id)
+            return
+        end
+
+        local clips_max = mcfg(media_id, "clips_per_trigger") or CONFIG.CLIPS_PER_TRIGGER
+
         -- 0 = play indefinitely (until timer or interrupt)
         if clips_max == 0 then
-            play_media(media_id, STATE.active_trigger_key)
+            play_media_clip(media_id)
             return
         end
 
         if STATE.clips_played < clips_max then
-            play_media(media_id, STATE.active_trigger_key)
+            play_media_clip(media_id)
             return
         end
 
@@ -1026,20 +1103,26 @@ local function load_schedule()
                 local start_min = parse_hhmm(parts[3])
                 local end_min   = parts[4] and parse_hhmm(parts[4]) or nil
 
-                if start_min then
+                if not start_min then
+                    warn("Schedule line " .. line_num .. ": bad start time '" .. parts[3] .. "' — skipping")
+                elseif etype ~= "loop" and etype ~= "media" then
+                    warn("Schedule line " .. line_num .. ": unknown event type '" .. parts[1] .. "' — skipping")
+                elseif etype == "loop" and not end_min then
+                    warn("Schedule line " .. line_num .. ": 'loop' entries need an end time " ..
+                         "(loop ID START END) — skipping")
+                else
                     table.insert(STATE.schedule_layers, {
                         type      = etype,
                         id        = eid,
                         start_min = start_min,
                         end_min   = end_min,
-                        priority  = line_num,   -- lower line = lower priority
                         fired     = false,
                         _last_min = -1,
                     })
                     log("Schedule [line " .. line_num .. "]: " .. etype .. " " .. eid)
-                else
-                    warn("Bad time on schedule line " .. line_num)
                 end
+            else
+                warn("Schedule line " .. line_num .. ": expected at least 3 fields (type id time) — skipping")
             end
         end
     end
