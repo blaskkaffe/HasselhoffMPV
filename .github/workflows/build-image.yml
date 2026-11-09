@@ -1,0 +1,95 @@
+name: Build USB image
+
+# Run it from the "Actions" tab -> "Build USB image" -> "Run workflow".
+# The finished disk image shows up under "Releases" (and as a build artifact).
+
+on:
+  workflow_dispatch:
+    inputs:
+      tz:
+        description: "Time zone of the player (e.g. Europe/Stockholm)"
+        default: "Europe/Stockholm"
+      kbd:
+        description: "Keyboard layout of the player (us, se, de, fr, gb ...)"
+        default: "se"
+      size:
+        description: "Image size - a little smaller than your stick (14G for a 16 GB stick)"
+        default: "14G"
+      release:
+        description: "Also publish the image as a GitHub Release"
+        type: boolean
+        default: true
+  push:
+    branches: [main, master]
+    paths-ignore: ["**.md"]
+  pull_request:
+
+permissions:
+  contents: write     # needed to create the release
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Lua
+        run: sudo apt-get update && sudo apt-get install -y lua5.3
+      - name: Check the player script
+        working-directory: tests
+        run: |
+          lua5.3 tests.lua ../mediaplayer.lua
+          lua5.3 fuzz.lua ../mediaplayer.lua
+      - name: Check the builder script
+        run: bash -n build-usb.sh
+
+  image:
+    # Only when started by hand: building takes ~25 minutes.
+    if: github.event_name == 'workflow_dispatch'
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the image
+        run: |
+          sudo bash build-usb.sh --image mediaplayer-stick.img \
+            --size "${{ inputs.size }}" --tz "${{ inputs.tz }}" --kbd "${{ inputs.kbd }}"
+
+      - name: Compress
+        run: |
+          xz -T0 -6 mediaplayer-stick.img
+          sha256sum mediaplayer-stick.img.xz | tee mediaplayer-stick.img.xz.sha256
+          ls -l mediaplayer-stick.img.xz
+
+      - name: Keep as build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mediaplayer-stick
+          path: |
+            mediaplayer-stick.img.xz
+            mediaplayer-stick.img.xz.sha256
+          compression-level: 0
+          retention-days: 14
+
+      - name: Publish release
+        if: inputs.release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # A release file may be at most 2 GiB: cut the image into pieces if needed.
+          split -b 1900M -d -a 3 mediaplayer-stick.img.xz mediaplayer-stick.img.xz.part
+          TAG="image-${{ github.run_number }}"
+          cat > notes.md <<NOTES
+          USB image for a ${{ inputs.size }} stick (time zone ${{ inputs.tz }}, keyboard ${{ inputs.kbd }}).
+
+          1. Download ALL the \`mediaplayer-stick.img.xz.partNNN\` files into one folder.
+          2. Join them:  \`cat mediaplayer-stick.img.xz.part* > mediaplayer-stick.img.xz\`
+             (Windows: \`copy /b mediaplayer-stick.img.xz.part000+mediaplayer-stick.img.xz.part001+mediaplayer-stick.img.xz.part002 mediaplayer-stick.img.xz\`)
+          3. Check it:  \`shasum -a 256 mediaplayer-stick.img.xz\`  must equal the line in the .sha256 file.
+          4. Flash \`mediaplayer-stick.img.xz\` with balenaEtcher.
+
+          See USB-SETUP.txt in the repository for the rest.
+          NOTES
+          gh release create "$TAG" --title "USB image $TAG" --notes-file notes.md \
+            mediaplayer-stick.img.xz.part* mediaplayer-stick.img.xz.sha256

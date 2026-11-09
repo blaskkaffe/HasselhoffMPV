@@ -1,0 +1,201 @@
+================================================================================
+  MEDIA PLAYER USB STICK - BUILD AND SETUP GUIDE
+================================================================================
+
+WHAT YOU GET
+------------
+A USB stick with TWO partitions that turns any 64-bit PC into the player:
+
+  1. MEDIAPLAYER   FAT32, first partition.  YOUR partition: videos, music,
+                   overlays, mediaplayer.lua, config.cfg (settings in plain
+                   text), schedule.cfg and a few small settings files.  Windows, macOS
+                   and Linux can all read and write it.
+  2. system        ext4, last 6 GB.  A minimal Linux (Ubuntu 24.04) that boots
+                   straight into the player: no login, no password, no desktop,
+                   no mouse cursor.  The only control is the keyboard, and only
+                   the keys you defined with your folder names.
+
+Behaviour
+  * Power on -> black screen -> the default loop (folder L0) starts by itself.
+    If there is no L0 folder (or it is empty) the screen simply stays black.
+  * The system is READ-ONLY: everything it writes lives in RAM.  Pulling the
+    power can never damage it, and the FAT32 partition is only ever read.
+  * The Linux side cannot be changed from the keyboard: no other consoles, no
+    Ctrl+Alt+Del, no Alt+Tab, no desktop, no mouse actions.
+  * Ctrl+q RESTARTS the player (handy after you changed a setting).  Set
+    QUIT_KEY = "" in mediaplayer.lua to remove even that.
+
+
+WHAT YOU NEED
+-------------
+  * A USB stick of 16 GB or more (the system uses 6 GB, the rest is yours).
+    A fast one (USB 3, 100+ MB/s read) is worth it for HD video.
+  * A Linux computer to BUILD the stick (once).  Ubuntu or Debian, with
+    internet.  A computer started from an Ubuntu live USB works fine, and so
+    does a Linux virtual machine (see "Building on GitHub instead (no Linux computer needed)
+  The repository contains a workflow that does the same build on GitHub:
+  Actions -> "Build USB image" -> Run workflow (choose time zone, keyboard,
+  size).  After about 25 minutes the image is under "Releases" in parts of
+  under 2 GB; the release notes say how to join them.  Then flash it with
+  balenaEtcher as described below.
+
+Building from a Mac or Windows PC").
+  * The player PC: 64-bit (Intel/AMD), BIOS or UEFI, Secure Boot OFF.
+
+
+1. BUILD THE STICK  (about 20 minutes, needs internet)
+------------------------------------------------------
+Put these files together in one folder on the Linux computer:
+    build-usb.sh  mediaplayer.lua  config.cfg  schedule.cfg  README.txt  USB-SETUP.txt
+
+Plug in the stick, find its name with:     lsblk
+(it is the disk with the right SIZE and no "/" mount point, e.g. /dev/sdb -
+ NOT a number like /dev/sdb1.  Choose carefully: the stick is ERASED.)
+
+    sudo bash build-usb.sh /dev/sdX --tz Europe/Stockholm --kbd se
+
+  --tz    your time zone (the scheduler uses it)    e.g. Europe/Stockholm
+  --kbd   the layout of the player's keyboard       us, se, de, fr, gb ...
+  --content FOLDER   optional: copy a folder of videos into content/ right away
+
+The script asks you to type the device name before it erases anything, and it
+refuses to touch a disk that is not a USB stick.
+
+When it says DONE the stick is ready.  (If a download fails it retries; if it
+still fails just run the command again.)
+
+Building from a Mac or Windows PC
+  Easiest: start a normal PC from an Ubuntu "live" USB (try without
+  installing), open a terminal there, and follow the steps above with a second
+  USB stick.  Or use a Linux virtual machine (UTM, VirtualBox, Parallels,
+  WSL2 does not work for USB) with the USB stick passed through to it.
+  No USB passthrough?  Build an IMAGE instead, then write it with balenaEtcher:
+
+      sudo bash build-usb.sh --image stick.img --size 14G --tz Europe/Stockholm --kbd se
+
+  (use a size a little smaller than the stick - 14G for a 16 GB stick - the
+   data partition fills the image.)  Image files are mostly empty and compress
+   very well.  If you write an image to a bigger stick the rest stays unused.
+
+
+2. PUT YOUR CONTENT ON THE STICK
+--------------------------------
+Plug the stick into your normal computer.  The partition called MEDIAPLAYER
+appears.  (Windows may offer to "scan and fix" it - just say no/cancel. If a
+second, unreadable drive appears, ignore it: that is the Linux part.)
+
+    MEDIAPLAYER/
+      content/            <- your folders: L0, L1 - Xmas, M1, M2 - Promos ...
+      mediaplayer.lua     <- the player (its top part holds all settings too)
+      config.cfg          <- settings in plain text: keys, fades, orders, per-mode
+                             options (wins over the values in mediaplayer.lua)
+      schedule.cfg        <- timed events
+      timezone.txt        <- time zone (first line)
+      keyboard.txt        <- keyboard layout of the player (first line)
+      mpv-options.txt     <- extra video/audio options (second monitor, rotation ...)
+      README.txt          <- how the folders and settings work
+      EFI/                <- boot files - do not touch
+
+Folder names, keys, overlays, music, schedule: see README.txt.
+Edit mediaplayer.lua and the .txt/.cfg files with a plain text editor
+(Notepad, TextEdit in plain-text mode, VS Code - NOT Word).
+
+FAT32 rules: single files must be under 4 GB; avoid the characters  " * : < > ? \ |
+in file and folder names.  Always "eject" the stick before pulling it out.
+
+Test on the computer first if you like: install mpv, copy the folder
+contents to a normal folder and run ./launch.sh --no-fs (see README.txt).
+
+
+3. FIRST START ON THE PLAYER PC
+-------------------------------
+  1. Plug the stick in, power on, open the boot menu (F12 / F10 / F8 / Esc,
+     depends on the PC) and pick the USB stick.  Either the "UEFI" or the plain
+     entry works.  To make it start by itself every time, put "USB" first in
+     the boot order in the BIOS/UEFI settings.
+  2. In the BIOS/UEFI settings also:
+       - turn Secure Boot OFF (the stick is not signed),
+       - set the clock to the correct LOCAL time (it is kept by the PC),
+       - set "restore on AC power loss" to ON if the PC should start by itself
+         when the power comes back.
+  3. After about 20-40 seconds you get the black screen and the L0 loop.
+
+The PC's clock is read as LOCAL time (like Windows).  If it shows UTC instead,
+add a line  rtc=utc  to timezone.txt.  Internet time sync is not part of the
+stick: keep the BIOS clock correct (a PC with a battery keeps it).
+
+
+4. CHANGING THINGS LATER
+------------------------
+  * New videos / settings: plug the stick into your computer, change files,
+    eject, put it back, power on (or press Ctrl+q on the player to restart it).
+  * Another keyboard layout, time zone, monitor, rotation, audio device:
+    edit keyboard.txt, timezone.txt, mpv-options.txt (they explain themselves).
+  * Sound goes to the default output (HDMI if a monitor with speakers is
+    attached, otherwise the headphone jack).  To force a device, add
+        --audio-device=...
+    to mpv-options.txt (see "Maintenance" for how to list the names).
+  * Wrong picture / stutter: add  --hwdec=no  to mpv-options.txt, or try
+    --vo=x11 (fades do not work with that one).
+
+
+5. MAINTENANCE MODE  (the player's Linux itself)
+------------------------------------------------
+Hold ESC (or Shift) right after the BIOS screen: a small menu appears.
+  "Media player"                       the normal start
+  "Maintenance (no player, changes ...)"  starts a text console as user "kiosk"
+                                       (no password, sudo works) WITHOUT the
+                                       player, and the system is writable in
+                                       this mode.  Type  sudo reboot  when done.
+Useful there:
+    KIOSK_ONCE=1 startx /opt/kiosk/session -- vt1 -br -nolisten tcp
+                                  runs the player once (Ctrl+q ends it); then
+                                  read what it said:   less /tmp/kiosk-player.log
+                                  (set DEBUG = true in mediaplayer.lua for more)
+    wpctl status                  sound devices (the number or name goes into
+                                  --audio-device=pipewire/NAME)
+    alsamixer                     volume / unmute analogue outputs
+
+If the player seems dead: the screen stays black when (a) there is no L0
+folder or it holds no playable files, (b) the stick's FAT32 partition could
+not be read, (c) mediaplayer.lua has a typing error.  Put the stick in your
+computer, check the files, try again.
+
+
+6. TROUBLESHOOTING
+------------------
+  The PC does not boot from the stick
+        -> boot menu / boot order; Secure Boot must be OFF; try the other
+           (UEFI / legacy) entry of the stick in the boot menu.
+  Black screen forever, no loop
+        -> see "If the player seems dead" above; make sure the folder is
+           really called L0 and sits inside the folder "content".
+  Keys do nothing
+        -> keyboard layout (keyboard.txt); the key must have a folder (M1 ...);
+           keys are ignored during cutscenes; LOCK_KEYS may be on.
+  No sound
+        -> sound needs a real output: check the HDMI/headphone cable and use
+           Maintenance -> alsamixer / wpctl status.
+  Video is garbled or green
+        -> add --hwdec=no to mpv-options.txt.
+  Fades do not show
+        -> the video output must be the GPU one; do not use --vo=x11.
+  Clock / schedule wrong
+        -> BIOS clock, timezone.txt, and "rtc=utc" if needed (section 3).
+
+
+7. WHAT HAS BEEN TESTED
+-----------------------
+The finished stick was built with build-usb.sh and booted in a PC emulator
+(UEFI mode).  Legacy BIOS boot, the ESC/Shift boot menu and the Maintenance
+entry are set up the standard way but were NOT confirmed in the emulator.
+Verified: the automatic start into a black screen and the
+loop, real key presses (media video, loop keys, a mixed video+song folder), the
+second hidden mpv playing a song, overlays (frame) on screen, fades,
+fullscreen, the sound server starting, read-only system with RAM overlay, the
+FAT32 partition readable and editable from a normal computer.
+NOT tested: real hardware (graphics drivers differ, but Intel/AMD/most others
+work with the standard open-source drivers; NVIDIA uses the generic driver),
+real audio output, Windows/macOS reading the stick, sticks other than the
+emulated one.  Test the stick on your actual player PC before relying on it.
+================================================================================

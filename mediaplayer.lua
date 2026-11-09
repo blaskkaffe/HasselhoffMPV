@@ -2,342 +2,299 @@
 ================================================================================
   MPV STATE MACHINE MEDIA CONTROLLER
 ================================================================================
-  A folder-driven state machine for MPV that handles:
-    - Continuous background loop playback
-    - Keyboard-triggered media modes (auto-bound from folder names)
-    - Scheduled loop switching and media triggering
-    - Per-loop content overrides (e.g. folder "L1M2" overrides "M2" during L1)
-    - Configurable cutscene transitions (Intro, Outro, Transition)
-    - Playlist ordering: sequential, reverse, ping-pong, shuffle, random
-    - Priority-layered scheduler (file order = priority, bottom = highest)
+  Folder-driven kiosk player for mpv: a silent background loop, keyboard- and
+  time-triggered media modes, intro/outro/transition cutscenes, per-loop
+  overrides, and fades between every clip.
 
-  FOLDER NAMING CONVENTIONS (all folders live in ROOT):
-    L0              → default loop (mapped to ESC key)
-    L1              → loop 1 (mapped to F1)
-    L1 - Christmas  → same as L1, human label after " - " is ignored
-    L12             → loop 12 (mapped to F12)
-    M1              → media mode 1 (mapped to key "1")
-    M2 - Promos     → same as M2, human label ignored
-    Ma              → media mode a (mapped to key "a")
-    L1M2            → override: replaces M2 when L1 is active
-    L1M2 - Label    → same as L1M2
-    Intro           → generic intro cutscene (fallback)
-    IntroM1         → intro for M1 specifically
-    IntroL1M1       → intro for M1 when L1 is active (highest priority)
-    Outro           → generic outro cutscene (fallback)
-    OutroM1         → outro for M1 specifically
-    OutroL1M1       → outro for M1 when L1 is active
-    Transition      → generic loop-switch cutscene (fallback)
-    TransitionL1    → cutscene played when switching TO L1
+  FOLDERS (all live directly in content/ — text after " - " is ignored):
+    L0, L1, L2 - Christmas   loops          L0 = ESC, L1..L12 = F1..F12
+    M1, M2 - Promos, Ma      media modes    key = the character after the M
+    L1M1, L1M1 - Xmas        override       replaces M1 while loop L1 is active
+    Intro / IntroM1 / IntroL1M1      cutscene before a media mode
+    Outro / OutroM1 / OutroL1M1      cutscene after a media mode
+    Transition / TransitionL1        cutscene when switching TO a loop
+    Cutscene fallback: most specific first, empty folder = skipped.
+    Overlay / L1Overlay / M1Overlay / L1M1Overlay
+                     PNG frames/logos (.png/.webp) and text (.txt) drawn on top
+                     of the picture. They STACK: Overlay shows everywhere,
+                     L1Overlay while loop L1 is active, M1Overlay while M1 plays.
+    Audio files (mp3 ...) in a media folder are SONGS: the loop video keeps
+    playing silently and the song plays on top of it. A folder may hold songs,
+    videos, or both mixed.
 
-  FILE NAMING CONVENTIONS (inside any folder):
-    01 - filename.mp4   → numbered (number defines order)
-    filename.mp4        → alphabetical fallback
+  FILES: "01 - name.mp4" plays in number order; un-numbered = alphabetical.
 
-  CUTSCENE FALLBACK CHAIN (most specific wins, empty folder = skip tier):
-    IntroL1M1 → IntroM1 → Intro   (then no cutscene if all empty/missing)
-    OutroL1M1 → OutroM1 → Outro
-    TransitionL1 → Transition
-
-  KEYBINDS (auto-generated from folder scan):
-    M1 → "1",  M2 → "2",  Ma → "a",  Mb → "b"
-    L1 → F1,   L2 → F2,   L12 → F12, L0 → ESC
-
-  LIVE USB NOTE:
-    The script uses its own directory as the base path automatically.
-    Launch with: mpv --script=/path/to/mediaplayer.lua --idle --fs
-
-  EXTERNAL CONFIG (optional):
-    Drop a config.cfg next to this script to override CONFIG defaults and
-    add per-mode/per-loop overrides without editing this file. See SECTION 6.
+  LAUNCH (see README):  launch.sh  /  launch.command
 ================================================================================
 --]]
 
 
 -- ==============================================================================
--- SECTION 1: PATH CONFIGURATION
--- All folders live directly under ROOT. No subfolders needed.
+-- SECTION 1: PATHS
 -- ==============================================================================
 
--- Resolve the script's own directory safely.
--- mp.get_script_directory() can return nil when mpv starts in --idle mode
--- with no file loaded. We fall back to mp.get_script_info() and then to
--- the current working directory so the script always has a usable base path.
 local function script_dir()
-    -- Priority 1: explicit override via --script-opts=mediaplayer-root=/path/to/dir
-    -- Use this when mpv can't resolve the script path automatically (e.g. --idle mode)
+    -- Explicit path from the launch script (most reliable):
+    --   --script-opts=mediaplayer-root=/path/to/folder
     local opt = mp.get_opt("mediaplayer-root")
     if opt and opt ~= "" then return opt end
-
-    -- Priority 2: mpv built-in (works when a file is already loaded)
     local d = mp.get_script_directory()
     if d and d ~= "" then return d end
-
-    -- Priority 3: parse from mp.get_script_info() on newer mpv builds
     local info = mp.get_script_info and mp.get_script_info()
     if info and info.filename then
         local dir = info.filename:match("^(.+)[/\\][^/\\]+$")
         if dir then return dir end
     end
-
-    -- Priority 4: current working directory — requires cd into folder before launch
-    return "."
+    return "."   -- works only if mpv was started from inside the folder
 end
 
 local SCRIPT_DIR = script_dir()
-mp.msg.info("[SM] Script directory: " .. SCRIPT_DIR)
+mp.msg.info("[SM] Base folder: " .. SCRIPT_DIR)
 
 local PATHS = {
-    -- Root content directory. All L, M, override, and cutscene folders go here.
-    ROOT = SCRIPT_DIR .. "/content/",
-
-    -- Schedule and config files sit alongside the script
+    ROOT     = SCRIPT_DIR .. "/content/",
     SCHEDULE = SCRIPT_DIR .. "/schedule.cfg",
     CONFIG   = SCRIPT_DIR .. "/config.cfg",
 }
 
 
 -- ==============================================================================
--- SECTION 2: GLOBAL CONFIGURATION DEFAULTS
--- Per-mode overrides are stored in MODES.media[id] and MODES.loops[id].
--- These are the fallback values when no per-mode override exists.
+-- SECTION 2: SETTINGS  (this is the part you edit)
+-- Prefer plain-text edits? Put the same settings in config.cfg next to this
+-- script instead (see SECTION 4b). Values in config.cfg win over this file.
 -- ==============================================================================
 
 local CONFIG = {
-    -- Scheduler tick rate in seconds
-    TICK_INTERVAL        = 1.0,
+    ---- Playback --------------------------------------------------------------
+    DEFAULT_LOOP         = "L0",       -- loop used when the schedule has no opinion
+    DEFAULT_ORDER        = "random",   -- sequential | reverse | pingpong | shuffle | random
+    CUTSCENE_ORDER       = "random",   -- sequential | shuffle | random
+    CLIPS_PER_TRIGGER    = 1,          -- clips played per key press (0 = until interrupted/timer)
+    SECONDS_PER_TRIGGER  = 0,          -- stop media after N seconds (0 = off; beats clip count)
+    LOOP_MUTED           = true,       -- loops are silent
 
-    -- The loop ID to use on startup (before scheduler kicks in)
-    DEFAULT_LOOP         = "L0",
+    ---- Keys ------------------------------------------------------------------
+    LOCK_KEYS            = false,      -- true: ignore every key while media plays
+    KEY_CANCEL           = false,      -- true: pressing the same key again cancels the media
+    QUIT_KEY             = "Ctrl+q",   -- "" disables the quit key
 
-    -- Default playback order for loops and media
-    -- Options: "sequential" | "reverse" | "pingpong" | "shuffle" | "random"
-    DEFAULT_ORDER        = "sequential",
+    ---- Cutscenes (a cutscene only plays if its folder exists and has files) --
+    CUTSCENE_ON_TRIGGER  = true,       -- Intro  before a media mode
+    CUTSCENE_ON_RETURN   = false,      -- Outro  after a media mode
+    CUTSCENE_ON_SWITCH   = false,      -- Transition when a loop changes
 
-    -- Default cutscene playback order
-    -- Options: "sequential" | "shuffle" | "random"
-    CUTSCENE_ORDER       = "random",
+    ---- Fades (brightness to black and back, around every clip) ---------------
+    FADE_ENABLED         = true,
+    FADE_OUT_DURATION    = 0.4,        -- seconds to fade to black
+    FADE_BLACK_HOLD      = 0.1,        -- seconds of black between clips (0 = none)
+    FADE_IN_DURATION     = 0.4,        -- seconds to fade in
+    FADE_BEFORE_END      = true,       -- also fade out just before a clip ends by itself
+    FADE_FPS             = 30,         -- smoothness of the fade
 
-    -- Clips to play per keyboard trigger. 0 = play until interrupted or timer.
-    CLIPS_PER_TRIGGER    = 1,
+    ---- Music (media folders that contain only audio files) -------------------
+    MPV_BINARY           = "mpv",      -- program used to play the songs (a second, hidden mpv)
+    MUSIC_VOLUME         = 100,        -- 0-100
+    MUSIC_FADE_IN        = 0,          -- seconds of fade-in at the start of every song (0 = off, plain start)
+    MUSIC_EXTRA_ARGS     = {},         -- extra mpv options for the song player, e.g. {"--audio-device=alsa/hw:1"}
 
-    -- Seconds to play per keyboard trigger. 0 = use CLIPS_PER_TRIGGER instead.
-    -- If both are non-zero, SECONDS_PER_TRIGGER takes precedence.
-    SECONDS_PER_TRIGGER  = 0,
+    ---- Overlays (PNG frames / logos / text, see the Overlay folders) ----------
+    OVERLAYS             = true,       -- false = switch all overlays off
+    OVERLAYS_ON_CUTSCENES = false,     -- show overlays during Intro/Outro/Transition too
 
-    -- When true: all keypresses are ignored while media is playing
-    LOCK_KEYS            = false,
-
-    -- When true: pressing the same key that triggered current media cancels it
-    -- Only applies when LOCK_KEYS = false
-    KEY_CANCEL           = false,
-
-    -- Whether to play an intro cutscene when entering a media mode
-    CUTSCENE_ON_TRIGGER  = true,
-
-    -- Whether to play an outro cutscene when returning to loop from media
-    CUTSCENE_ON_RETURN   = true,
-
-    -- Whether to play a transition cutscene when switching loops
-    CUTSCENE_ON_SWITCH   = true,
-
-    -- Mute audio during loop playback (loops are usually silent ambience)
-    LOOP_MUTED           = true,
+    ---- Misc ------------------------------------------------------------------
+    TICK_INTERVAL        = 1.0,        -- scheduler check interval (seconds)
+    DEBUG                = false,      -- true: log every mpv end-file event
 }
 
-
--- ==============================================================================
--- SECTION 3: PER-MODE CONFIGURATION
--- media_cfg / loop_cfg can be populated two ways: hard-coded here, or via
--- config.cfg (Section 6) using [M1] / [L1] style sections. config.cfg wins
--- per-key on conflict; anything it doesn't mention keeps what's written here.
--- Each entry uses the mode ID (e.g. "M1", "L1") as the key.
--- Any key not set (here or in config.cfg) falls back to CONFIG defaults above.
--- ==============================================================================
-
+-- Per-mode overrides. Anything not listed here uses CONFIG above.
+-- Keys: order, clips_per_trigger, seconds_per_trigger, lock_keys, key_cancel,
+--       cutscene_on_trigger (Intro), cutscene_on_return (Outro),
+--       cutscene_on_switch (loops only), overlays (false = hide all overlays in this mode)
+--       Songs also: music (false = play audio files like videos),
+--       visual_loop ("L5": show that loop's video while the songs play)
+--
+-- Example:
+--   media_cfg = {
+--       M1 = { order = "shuffle", clips_per_trigger = 2, cutscene_on_return = true },
+--       M3 = { order = "pingpong", seconds_per_trigger = 30, key_cancel = true },
+--   },
+--   loop_cfg = {
+--       L1 = { order = "pingpong", cutscene_on_switch = true },
+--   },
 local MODES = {
-    -- Populated by scanner: { id, folder_path, label }
-    loops  = {},   -- keyed by loop ID e.g. "L0", "L1"
-    media  = {},   -- keyed by media ID e.g. "M1", "Ma"
-    -- Populated by scanner: { loop_id, media_id, folder_path }
-    overrides = {},  -- keyed by "L1M2" etc.
-
-    -- Per-mode config overrides (optional — set here to override CONFIG defaults)
-    -- Example:
-    --   media_cfg = {
-    --     M1 = { order="shuffle", clips_per_trigger=2, cutscene_on_trigger=true },
-    --     M2 = { lock_keys=true, cutscene_on_return=false },
-    --   }
+    loops     = {},   -- filled by the folder scan
+    media     = {},
+    overrides = {},
+    overlay_dirs = {},   -- "*" (global), "L1", "M1", "L1M1" -> overlay folder path
     media_cfg = {},
     loop_cfg  = {},
 }
 
 
 -- ==============================================================================
--- SECTION 4: RUNTIME STATE
--- Live state of the system. Managed entirely by state machine functions.
--- Do not edit manually.
+-- SECTION 3: RUNTIME STATE (managed by the script — do not edit)
 -- ==============================================================================
 
 local STATE = {
-    current_loop        = CONFIG.DEFAULT_LOOP,  -- active loop ID
-    current_media       = nil,                  -- active media ID or nil
-    phase               = "loop",               -- "loop" | "media" | "cutscene"
-    in_cutscene         = false,                -- true while a cutscene plays
-    cutscene_done       = nil,                  -- callback after cutscene ends
+    current_loop       = CONFIG.DEFAULT_LOOP,
+    current_media      = nil,
+    phase              = "loop",   -- "loop" | "media" | "cutscene"
+    cutscene_done      = nil,      -- what to do when the running cutscene ends
 
-    playlists           = {},   -- per-folder playlist state (index, direction, pool)
-    pending_loop        = nil,  -- deferred loop switch from scheduler
-    pending_media       = nil,  -- deferred media trigger from scheduler
+    playing            = false,    -- a clip we loaded is on screen / playing
+    transitioning      = false,    -- fading out the old clip before loading the next
+    token              = 0,        -- bumped by every new transition; stale ones abort
+    fade_id            = 0,        -- bumped by every brightness animation
+    bright             = 0,        -- current brightness (0 normal .. -100 black)
+    end_faded          = false,    -- the "fade before end" already started for this clip
 
-    media_timer         = nil,  -- handle for SECONDS_PER_TRIGGER timeout
-    media_seconds_active = false, -- true while a seconds-based timer owns the current trigger
-                                   -- (clip-count limit is ignored until it fires)
-    clips_played        = 0,    -- clips played in current media trigger
-    active_trigger_key  = nil,  -- key that triggered current media (key_cancel logic)
+    playlists          = {},
+    pending_loop       = nil,      -- scheduler wants this loop after the current media
+    pending_media      = nil,      -- scheduler wants this media after the current media
+    media_timer        = nil,
+    clips_played       = 0,
+    active_trigger_key = nil,
 
-    -- Parsed schedule events, in file order — that order IS the priority
-    -- (see SECTION 15): later entries overwrite earlier matches.
-    schedule_layers     = {},
-    _initialised        = false,
+    music              = nil,      -- {media_id, folder, serial, cmd} while songs are playing
+    visual_loop        = nil,      -- loop whose video is shown during a music mode
+    clip_kind          = nil,      -- "loop" | "media" | "cutscene": what is on screen
+    vw                 = 1920,     -- size of the video on screen (learned from mpv)
+    vh                 = 1080,
+    vf_graph           = "",       -- overlay filter graph currently applied
+    texts              = {},       -- text overlays currently shown
+    text_ov            = nil,      -- mpv osd overlay object
+    text_last          = nil,
+    overlay_cache      = {},
+
+    schedule_layers    = {},
+    sched_loop         = nil,      -- last loop the *scheduler* asked for
+    warned             = {},
+    _initialised       = false,
 }
 
 
 -- ==============================================================================
--- SECTION 5: UTILITIES
--- Low-level helpers used throughout the script.
+-- SECTION 4: UTILITIES
 -- ==============================================================================
 
 local utils = require("mp.utils")
 
-local function log(msg)  mp.msg.info("[SM] " .. tostring(msg))  end
-local function warn(msg) mp.msg.warn("[SM] WARN: " .. tostring(msg)) end
+local function log(msg)   mp.msg.info("[SM] " .. tostring(msg)) end
+local function warn(msg)  mp.msg.warn("[SM] WARN: " .. tostring(msg)) end
+local function debug_log(msg) if CONFIG.DEBUG then log(msg) end end
 
--- Check whether a filesystem path exists
-local function path_exists(p)
-    return utils.file_info(p) ~= nil
+-- Warn only once per key, so a persistent problem cannot flood the log
+local function warn_once(key, msg)
+    if STATE.warned[key] then return end
+    STATE.warned[key] = true
+    warn(msg)
 end
 
--- Join path segments, handling trailing/leading slashes
+local function path_exists(p) return utils.file_info(p) ~= nil end
+
 local function join(...)
     local parts = {...}
     local r = parts[1]:gsub("/$", "")
     for i = 2, #parts do
-        r = r .. "/" .. parts[i]:gsub("^/", ""):gsub("/$", "")
+        local seg = parts[i]:gsub("^/", ""):gsub("/$", "")
+        r = r .. "/" .. seg
     end
     return r
 end
 
--- Return the ID portion of a folder name, stripping " - Label" suffix.
--- e.g. "L1 - Christmas" → "L1", "M2 - Promos" → "M2", "L1M2" → "L1M2"
+-- "L1 - Christmas" -> "L1"   "M2 - Promos" -> "M2"   "L1M2" -> "L1M2"
 local function parse_folder_id(name)
-    return name:match("^([^%-]+)") :gsub("%s+$", "")
+    local id = name:match("^([^%-]*)") or name
+    id = id:gsub("^%s+", ""):gsub("%s+$", "")
+    return id
 end
 
--- Supported media file extensions
 local MEDIA_EXT = {
-    mp4=true, mkv=true, avi=true, mov=true, webm=true,
-    flv=true, wmv=true, m4v=true,
-    mp3=true, aac=true, wav=true, ogg=true, flac=true, m4a=true,
+    mp4=true, mkv=true, avi=true, mov=true, webm=true, flv=true, wmv=true, m4v=true,
+    mp3=true, aac=true, wav=true, ogg=true, flac=true, m4a=true, opus=true,
 }
+local AUDIO_EXT = { mp3=true, aac=true, wav=true, ogg=true, flac=true, m4a=true, opus=true }
 
--- Scan a folder for playable files, sorted by leading number then alphabetically.
--- Returns an empty table (not nil) if folder is missing or empty.
+-- Numbered files first (by number), then A-Z
+local function file_less(a, b)
+    if a.number and b.number then
+        if a.number ~= b.number then return a.number < b.number end
+        return a.name < b.name
+    elseif a.number then return true
+    elseif b.number then return false
+    else return a.name < b.name end
+end
+
+-- Playable files in a folder: numbered files first (by number), then A-Z.
+-- Hidden files (".DS_Store", macOS "._clip.mp4" leftovers on USB sticks) are skipped.
 local function scan_files(folder_path)
     local files = {}
     if not path_exists(folder_path) then return files end
     local entries = utils.readdir(folder_path, "files")
     if not entries then return files end
-
     for _, name in ipairs(entries) do
         local ext = name:match("%.([^%.]+)$")
-        if ext and MEDIA_EXT[ext:lower()] then
-            table.insert(files, {
+        if ext and MEDIA_EXT[ext:lower()] and name:sub(1, 1) ~= "." then
+            files[#files + 1] = {
                 name   = name,
                 path   = join(folder_path, name),
                 number = tonumber(name:match("^(%d+)")),
-            })
+                audio  = AUDIO_EXT[ext:lower()] == true,
+            }
         end
     end
-
-    table.sort(files, function(a, b)
-        if a.number and b.number then return a.number < b.number
-        elseif a.number then return true
-        elseif b.number then return false
-        else return a.name < b.name end
-    end)
+    table.sort(files, file_less)
     return files
 end
 
--- Shallow copy of an array table
 local function copy(t)
     local c = {}
     for i, v in ipairs(t) do c[i] = v end
     return c
 end
 
--- Read a per-mode config value, falling back to global CONFIG
-local function mcfg(media_id, key)
+-- Setting lookup: per-mode value first, then the global CONFIG
+local function lookup(tbl, id, key)
     local cfg_key = key:upper()
-    if media_id and MODES.media_cfg[media_id] then
-        local v = MODES.media_cfg[media_id][key]
+    if id and tbl[id] then
+        local v = tbl[id][key]
         if v ~= nil then return v end
-        -- Also check uppercase variant
-        v = MODES.media_cfg[media_id][cfg_key]
+        v = tbl[id][cfg_key]
         if v ~= nil then return v end
     end
-    -- Fall back to global CONFIG (try both "key" and "DEFAULT_KEY" forms)
-    if CONFIG["DEFAULT_" .. cfg_key] ~= nil then
-        return CONFIG["DEFAULT_" .. cfg_key]
-    end
+    if CONFIG["DEFAULT_" .. cfg_key] ~= nil then return CONFIG["DEFAULT_" .. cfg_key] end
     return CONFIG[cfg_key]
 end
-
-local function lcfg(loop_id, key)
-    local cfg_key = key:upper()
-    if loop_id and MODES.loop_cfg[loop_id] then
-        local v = MODES.loop_cfg[loop_id][key]
-        if v ~= nil then return v end
-        v = MODES.loop_cfg[loop_id][cfg_key]
-        if v ~= nil then return v end
-    end
-    if CONFIG["DEFAULT_" .. cfg_key] ~= nil then
-        return CONFIG["DEFAULT_" .. cfg_key]
-    end
-    return CONFIG[cfg_key]
-end
+local function mcfg(media_id, key) return lookup(MODES.media_cfg, media_id, key) end
+local function lcfg(loop_id, key)  return lookup(MODES.loop_cfg,  loop_id,  key) end
 
 
 -- ==============================================================================
--- SECTION 6: EXTERNAL CONFIG LOADER
--- Reads config.cfg (optional — built-in defaults above apply if it's missing).
--- Lets you tune CONFIG and add per-mode/per-loop overrides without touching
--- this script, so a live USB deployment only ever needs plain-text edits.
+-- SECTION 4b: EXTERNAL CONFIG  (config.cfg, optional)
+-- Lets you change CONFIG and the per-mode overrides with a plain-text file next
+-- to this script, so the stick only ever needs text edits.
 --
--- CONFIG.CFG FORMAT:
 --   # comment
---   key = value              global override — key must match a CONFIG.* field
---                             (case-insensitive, e.g. "default_loop" → DEFAULT_LOOP)
+--   key = value        global setting; key is a CONFIG name (any case):
+--                      default_loop = L1     lock_keys = true     quit_key = ""
 --
---   [M1]                     media mode section → MODES.media_cfg["M1"]
+--   [M1]               per-media-mode section  (M1, M2, Ma ...)
 --   order = shuffle
 --   clips_per_trigger = 2
 --
---   [L1]                     loop section → MODES.loop_cfg["L1"]
+--   [L1]               per-loop section  (L1, L12 ...)
 --   order = pingpong
---   cutscene_on_switch = true
 --
--- Values are auto-typed: "true"/"false" → boolean, numeric strings → number,
--- anything else stays a string. Unknown global keys and section headers are
--- warned about (mp.msg) and skipped rather than failing the whole file.
--- config.cfg values win per-key over anything hard-coded in SECTION 3; keys
--- not mentioned in config.cfg keep whatever SECTION 3 (or the CONFIG default)
--- already had.
+-- Values: true/false -> boolean, numbers -> number, anything else -> text
+-- (quotes around text are optional). Unknown keys/sections are warned about
+-- and skipped. config.cfg wins over the values hard-coded above.
+-- List settings (MUSIC_EXTRA_ARGS) can only be changed in this file.
 -- ==============================================================================
 
--- Coerce a raw string value to boolean / number / string.
 local function parse_cfg_value(raw)
-    local v   = raw:match("^%s*(.-)%s*$")
+    local v = raw:match("^%s*(.-)%s*$")
+    local q = v:match('^"(.*)"$') or v:match("^'(.*)'$")
+    if q ~= nil then return q end
     local low = v:lower()
     if low == "true"  then return true  end
     if low == "false" then return false end
@@ -348,25 +305,16 @@ end
 
 local function load_config()
     if not path_exists(PATHS.CONFIG) then
-        log("No external config file: " .. PATHS.CONFIG .. " — using built-in defaults")
+        log("No config.cfg - using the settings in mediaplayer.lua")
         return
     end
-
     local f = io.open(PATHS.CONFIG, "r")
-    if not f then
-        warn("Cannot open config: " .. PATHS.CONFIG)
-        return
-    end
+    if not f then warn("Cannot open " .. PATHS.CONFIG); return end
 
-    local section  = nil  -- nil = global scope, or {kind="media"|"loop"|"invalid", id=...}
-    local line_num = 0
-    local applied  = 0
-
+    local section, line_num, applied = nil, 0, 0
     for raw_line in f:lines() do
         line_num = line_num + 1
-        -- Strip "# ..." comments (rest of line), then trim whitespace
-        local line = raw_line:gsub("#.*$", ""):match("^%s*(.-)%s*$")
-
+        local line = raw_line:gsub("\r", ""):gsub("^\239\187\191", ""):gsub("#.*$", ""):match("^%s*(.-)%s*$")
         if line ~= "" then
             local header = line:match("^%[%s*(.-)%s*%]$")
             if header then
@@ -379,750 +327,951 @@ local function load_config()
                     section = { kind = "invalid" }
                 end
             else
-                local key, val = line:match("^([%w_]+)%s*=%s*(.+)$")
+                local key, val = line:match("^([%w_]+)%s*=%s*(.*)$")
                 if not key then
                     warn("config.cfg line " .. line_num .. ": cannot parse: " .. line)
+                elseif section and section.kind == "invalid" then
+                    -- header already reported
                 else
                     local value = parse_cfg_value(val)
                     if not section then
-                        local cfg_key = key:upper()
-                        if CONFIG[cfg_key] ~= nil then
-                            CONFIG[cfg_key] = value
+                        local k = key:upper()
+                        if type(CONFIG[k]) == "table" then
+                            warn("config.cfg line " .. line_num .. ": '" .. key .. "' is a list; set it in mediaplayer.lua")
+                        elseif CONFIG[k] ~= nil then
+                            CONFIG[k] = value
                             applied = applied + 1
                         else
-                            warn("config.cfg line " .. line_num .. ": unknown global key '" .. key .. "'")
+                            warn("config.cfg line " .. line_num .. ": unknown setting '" .. key .. "'")
                         end
-                    elseif section.kind == "media" then
-                        MODES.media_cfg[section.id] = MODES.media_cfg[section.id] or {}
-                        MODES.media_cfg[section.id][key:lower()] = value
-                        applied = applied + 1
-                    elseif section.kind == "loop" then
-                        MODES.loop_cfg[section.id] = MODES.loop_cfg[section.id] or {}
-                        MODES.loop_cfg[section.id][key:lower()] = value
+                    else
+                        local tbl = (section.kind == "media") and MODES.media_cfg or MODES.loop_cfg
+                        tbl[section.id] = tbl[section.id] or {}
+                        tbl[section.id][key:lower()] = value
                         applied = applied + 1
                     end
-                    -- section.kind == "invalid": already warned at the header, drop silently
                 end
             end
         end
     end
-    f:close()
-    log("Config loaded: " .. applied .. " value(s) from " .. PATHS.CONFIG)
+    f.close(f)
+    log("config.cfg: " .. applied .. " value(s) applied")
 end
 
 
 -- ==============================================================================
--- SECTION 7: FOLDER SCANNER
--- Scans ROOT for all L, M, override, and cutscene folders.
--- Populates MODES.loops, MODES.media, MODES.overrides.
--- Auto-generates keybindings from folder names.
+-- SECTION 5: FOLDER SCANNER
 -- ==============================================================================
 
 local function scan_root()
     local entries = utils.readdir(PATHS.ROOT, "dirs")
     if not entries then
-        warn("Cannot read ROOT folder: " .. PATHS.ROOT)
+        warn("Cannot read content folder: " .. PATHS.ROOT)
         return
     end
-
     for _, name in ipairs(entries) do
-        local id = parse_folder_id(name)
+        local id          = parse_folder_id(name)
         local folder_path = join(PATHS.ROOT, name)
-
-        -- ---------------------------------------------------------------
-        -- Loop folders: start with L followed by one or more digits
-        -- e.g. "L0", "L1", "L12 - Christmas"
-        -- ---------------------------------------------------------------
-        local matched = false
 
         local loop_num = id:match("^L(%d+)$")
         if loop_num then
-            matched = true
-            local loop_id = "L" .. loop_num
-            MODES.loops[loop_id] = {
-                id    = loop_id,
-                path  = folder_path,
-                label = name:match("^[^%-]+%-%s*(.+)$") or loop_id,
-                num   = tonumber(loop_num),
-            }
-            log("Loop found: " .. loop_id .. " → " .. folder_path)
+            local loop_id = "L" .. tonumber(loop_num)
+            MODES.loops[loop_id] = { id = loop_id, path = folder_path, num = tonumber(loop_num) }
+            log("Loop found:     " .. loop_id .. "  (" .. name .. ")")
         end
 
-        -- ---------------------------------------------------------------
-        -- Media folders: start with M followed by a digit or lowercase letter
-        -- e.g. "M1", "M2 - Promos", "Ma", "Mb - Special"
-        -- ---------------------------------------------------------------
         local media_char = id:match("^M([%d%l])$")
         if media_char then
-            matched = true
             local media_id = "M" .. media_char
-            MODES.media[media_id] = {
-                id    = media_id,
-                path  = folder_path,
-                label = name:match("^[^%-]+%-%s*(.+)$") or media_id,
-                char  = media_char,
-            }
-            log("Media found: " .. media_id .. " → " .. folder_path)
+            MODES.media[media_id] = { id = media_id, path = folder_path, char = media_char }
+            log("Media found:    " .. media_id .. "  (" .. name .. ")")
         end
 
-        -- ---------------------------------------------------------------
-        -- Override folders: L followed by digits then M followed by digit/letter
-        -- e.g. "L1M2", "L1Ma", "L1M2 - Christmas version"
-        -- ---------------------------------------------------------------
+        -- Overlay folders: "Overlay", "L1Overlay", "M1Overlay", "L1M1Overlay"
+        local ov_key = (id == "Overlay") and "*" or id:match("^(L%d+M[%d%l])Overlay$")
+                       or id:match("^(L%d+)Overlay$") or id:match("^(M[%d%l])Overlay$")
+        if ov_key then MODES.overlay_dirs[ov_key] = folder_path end
+
         local ov_loop, ov_media = id:match("^(L%d+)(M[%d%l])$")
-        if ov_loop and ov_media then
-            matched = true
+        if ov_loop then
             local ov_id = ov_loop .. ov_media
-            MODES.overrides[ov_id] = {
-                id        = ov_id,
-                loop_id   = ov_loop,
-                media_id  = ov_media,
-                path      = folder_path,
-                label     = name:match("^[^%-]+%-%s*(.+)$") or ov_id,
-            }
-            log("Override found: " .. ov_id .. " → " .. folder_path)
-        end
-
-        -- Cutscene folders (Intro, Outro, Transition + variants) are resolved
-        -- dynamically in Section 9 — no pre-registration needed, and they
-        -- intentionally don't start with L/M so they never hit the warning
-        -- below.
-        if not matched and id:match("^[LM]") then
-            warn("Folder '" .. name .. "' starts with L/M but doesn't match a known " ..
-                 "naming pattern (Ln, Mx, or LnMx) — ignoring it. See README.txt.")
+            MODES.overrides[ov_id] = { id = ov_id, loop_id = ov_loop, media_id = ov_media, path = folder_path }
+            log("Override found: " .. ov_id .. "  (" .. name .. ")")
         end
     end
 end
 
 
 -- ==============================================================================
--- SECTION 8: KEYBINDING (auto-generated after folder scan)
--- M folders → digit/letter key. L folders → Fkey. L0 → ESC.
+-- SECTION 6: CUTSCENE RESOLVER
+--   Intro:      IntroL1M1 -> IntroM1 -> Intro
+--   Outro:      OutroL1M1 -> OutroM1 -> Outro
+--   Transition: TransitionL1 -> Transition
+-- A folder that is missing OR empty is skipped (falls back one tier).
 -- ==============================================================================
 
--- Forward declarations
-local handle_media_key
-local handle_loop_key
-
-local function register_keybinds()
-    -- Media keybinds: character after M becomes the key.
-    --
-    -- Bind every media ID that exists EITHER as a default M-folder OR as
-    -- at least one loop-specific override (e.g. only "L1M2" exists, no
-    -- plain "M2"). The key is bound unconditionally, but handle_media_key
-    -- / resolve_media_folder already only resolve a folder for the
-    -- *current* loop, so pressing the key while no loop-appropriate
-    -- folder exists for it is already a correct no-op — this just makes
-    -- sure override-only modes get a key bound at all.
-    local media_keys = {}
-    for media_id, info in pairs(MODES.media) do
-        media_keys[media_id] = info.char
-    end
-    for _, ov in pairs(MODES.overrides) do
-        if not media_keys[ov.media_id] then
-            media_keys[ov.media_id] = ov.media_id:sub(2)  -- "M2" -> "2"
-        end
-    end
-
-    for media_id, key in pairs(media_keys) do
-        local mid = media_id   -- capture for closure
-        mp.add_key_binding(key, "media_" .. mid, function()
-            handle_media_key(mid, key)
-        end)
-        log("Keybind: [" .. key .. "] → " .. mid)
-    end
-
-    -- Loop keybinds: L0 → ESC, L1 → F1, L2 → F2 ... L12 → F12
-    for loop_id, info in pairs(MODES.loops) do
-        local n   = info.num
-        local lid = loop_id
-        local key
-        if n == 0 then
-            key = "ESC"
-        elseif n >= 1 and n <= 12 then
-            key = "F" .. n
-        else
-            -- L13+ have no automatic F-key (F-keys only go to F12)
-            -- They can still be triggered by the scheduler
-            warn("No F-key available for " .. loop_id .. " (> L12) — scheduler only")
-        end
-
-        if key then
-            mp.add_key_binding(key, "loop_" .. lid, function()
-                handle_loop_key(lid)
-            end)
-            log("Keybind: [" .. key .. "] → " .. lid)
-        end
-    end
-end
-
-
--- ==============================================================================
--- SECTION 9: CUTSCENE RESOLVER
--- Finds the best matching cutscene folder using the fallback chain.
--- Returns a folder path if a non-empty match is found, or nil.
---
--- Fallback chains:
---   Intro:      IntroL{n}M{x} → IntroM{x} → Intro
---   Outro:      OutroL{n}M{x} → OutroM{x} → Outro
---   Transition: TransitionL{n} → Transition
--- Empty folder = intentional skip (stops fallback chain, returns nil).
--- Missing folder = fall through to next tier.
--- ==============================================================================
-
--- Returns path+true if folder exists and has files.
--- Returns nil+true if folder exists but is empty (intentional skip).
--- Returns nil+false if folder does not exist (fall through).
 local function usable_folder(path)
-    if not path_exists(path) then return nil, false end
-    local files = scan_files(path)
-    if #files > 0 then return path, true end
-    return nil, true  -- exists but empty — intentional skip
+    if path_exists(path) and #scan_files(path) > 0 then return path end
+    return nil
 end
 
 local function resolve_cutscene(prefix, loop_id, media_id)
-    -- Tier 1: most specific — loop + media
     if loop_id and media_id then
-        local p, exists = usable_folder(join(PATHS.ROOT, prefix .. loop_id .. media_id))
-        if exists then return p end
+        local p = usable_folder(join(PATHS.ROOT, prefix .. loop_id .. media_id))
+        if p then return p end
     end
-    -- Tier 2: media only
     if media_id then
-        local p, exists = usable_folder(join(PATHS.ROOT, prefix .. media_id))
-        if exists then return p end
+        local p = usable_folder(join(PATHS.ROOT, prefix .. media_id))
+        if p then return p end
     end
-    -- Tier 3: loop only (used for Transition)
     if loop_id and not media_id then
-        local p, exists = usable_folder(join(PATHS.ROOT, prefix .. loop_id))
-        if exists then return p end
+        local p = usable_folder(join(PATHS.ROOT, prefix .. loop_id))
+        if p then return p end
     end
-    -- Tier 4: generic fallback
-    local p = usable_folder(join(PATHS.ROOT, prefix))
-    return p  -- nil if nothing found
+    return usable_folder(join(PATHS.ROOT, prefix))
 end
 
+
 -- ==============================================================================
--- SECTION 10: PLAYLIST ENGINE
--- Per-folder playlist state. Tracks position, direction, shuffle pool.
+-- SECTION 7: PLAYLIST ENGINE (one independent playlist per folder)
 -- ==============================================================================
 
 local function get_playlist(folder_path)
     if not STATE.playlists[folder_path] then
         local files = scan_files(folder_path)
         STATE.playlists[folder_path] = {
-            files     = files,
-            index     = 1,
-            direction = 1,       -- 1=forward, -1=reverse (pingpong)
-            pool      = copy(files),
+            files = files, index = 1, direction = 1, pool = copy(files),
         }
-        log("Playlist init: " .. folder_path .. " (" .. #files .. " files)")
+        log("Playlist ready: " .. folder_path .. " (" .. #files .. " files)")
     end
     return STATE.playlists[folder_path]
 end
 
 local function next_file(folder_path, order)
     local pl = get_playlist(folder_path)
-    if #pl.files == 0 then
-        warn("Empty playlist: " .. folder_path)
-        return nil
-    end
+    local n = #pl.files
+    if n == 0 then return nil end
 
     if order == "random" then
-        return pl.files[math.random(1, #pl.files)]
+        return pl.files[math.random(1, n)]
 
-    elseif order == "shuffle" then
-        if #pl.pool == 0 then
-            pl.pool = copy(pl.files)
-        end
-        local i    = math.random(1, #pl.pool)
-        local file = pl.pool[i]
-        table.remove(pl.pool, i)
-        return file
+    elseif order == "shuffle" then               -- no repeats until all have played
+        if #pl.pool == 0 then pl.pool = copy(pl.files) end
+        local i = math.random(1, #pl.pool)
+        return table.remove(pl.pool, i)
 
     elseif order == "reverse" then
         local file = pl.files[pl.index]
-        pl.index   = pl.index - 1
-        if pl.index < 1 then pl.index = #pl.files end
+        pl.index = pl.index - 1
+        if pl.index < 1 then pl.index = n end
         return file
 
-    elseif order == "pingpong" then
+    elseif order == "pingpong" then              -- forward, then backward, repeat
         local file = pl.files[pl.index]
-        pl.index   = pl.index + pl.direction
-        if pl.index > #pl.files then
-            pl.direction = -1
-            pl.index     = math.max(1, #pl.files - 1)
+        if n == 1 then return file end
+        pl.index = pl.index + pl.direction
+        if pl.index > n then
+            pl.direction, pl.index = -1, n - 1
         elseif pl.index < 1 then
-            pl.direction = 1
-            pl.index     = math.min(#pl.files, 2)
+            pl.direction, pl.index = 1, 2
         end
         return file
 
-    else  -- sequential (default)
+    else                                         -- sequential
         local file = pl.files[pl.index]
-        pl.index   = pl.index + 1
-        if pl.index > #pl.files then pl.index = 1 end
+        pl.index = pl.index + 1
+        if pl.index > n then pl.index = 1 end
         return file
     end
 end
 
 
 -- ==============================================================================
--- SECTION 11: OVERRIDE RESOLVER
--- Finds the right content folder for a media mode given the active loop.
--- Priority: L{n}M{x} override → default M{x} folder
+-- SECTION 8: OVERRIDE RESOLVER
+--   active loop L1 + key for M1  ->  folder L1M1 if it exists, else M1
 -- ==============================================================================
 
 local function resolve_media_folder(media_id)
-    -- Check for a loop-specific override first
-    local ov_id   = STATE.current_loop .. media_id  -- e.g. "L1M2"
-    local override = MODES.overrides[ov_id]
-    if override then
-        log("Override active: " .. ov_id)
-        return override.path
-    end
-    -- Fall back to the default media folder
+    local ov = MODES.overrides[STATE.current_loop .. media_id]
+    if ov then return ov.path, true end
     local info = MODES.media[media_id]
-    if info then return info.path end
+    if info then return info.path, false end
     return nil
 end
 
 local function resolve_loop_folder(loop_id)
     local info = MODES.loops[loop_id]
-    if info then return info.path end
-    return nil
+    return info and info.path or nil
 end
 
 
 -- ==============================================================================
--- SECTION 12: PLAYBACK ENGINE
--- Core state transitions: loop → cutscene → media → cutscene → loop
+-- SECTION 8b: OVERLAYS
+-- Folders in content/ (all optional, all STACK on top of each other):
+--     Overlay          always            L1Overlay     while loop L1 is active
+--     M1Overlay        while M1 plays    L1M1Overlay   while M1 plays under L1
+-- Inside a folder:
+--   *.png / *.webp   transparent picture. Stretched over the whole picture
+--                    (a frame), unless the file name contains tags:
+--                      top-left top-center top-right middle-left center
+--                      middle-right bottom-left bottom-center bottom-right
+--                      40%        width as % of the picture (height follows)
+--                      opacity50  50 % visible
+--                    e.g. "logo bottom-right 12%.png"   (no position tag + no % = frame)
+--   *.txt            text. Either just the text, or settings then text:
+--                      position: bottom-center    size: 48     color: FFFFFF
+--                      outline: 3                 text: Merry Christmas
+--                    (everything after "text:" is the text, several lines allowed)
+-- Pictures are drawn by an mpv video filter, text by mpv's on-screen display.
 -- ==============================================================================
 
--- Forward declarations
-local play_loop, play_media, play_cutscene, return_to_loop, switch_loop
-local play_media_clip, start_media_trigger
+local OVERLAY_POS = {   -- name -> horizontal (l c r), vertical (t m b); longest names first
+    { "bottom-center", "c", "b" }, { "bottom-right", "r", "b" }, { "bottom-left", "l", "b" },
+    { "middle-right",  "r", "m" }, { "middle-left",  "l", "m" },
+    { "top-center",    "c", "t" }, { "top-right",    "r", "t" }, { "top-left",    "l", "t" },
+    { "center",        "c", "m" },
+}
 
-play_loop = function()
-    STATE.phase             = "loop"
-    STATE.current_media     = nil
-    STATE.clips_played      = 0
-    STATE.active_trigger_key = nil
-    STATE.in_cutscene       = false
-
-    local folder = resolve_loop_folder(STATE.current_loop)
-    if not folder then
-        warn("No folder for loop: " .. STATE.current_loop)
-        return
+local function parse_image_tags(name)
+    local lname = name:lower():gsub("%.[^%.]+$", "")
+    local e = { pos_h = nil, pos_v = nil, pct = tonumber(lname:match("(%d+)%%")),
+                opacity = tonumber(lname:match("opacity(%d+)")) }
+    for _, p in ipairs(OVERLAY_POS) do
+        if lname:find(p[1], 1, true) then e.pos_h, e.pos_v = p[2], p[3]; break end
     end
-
-    local order = lcfg(STATE.current_loop, "order") or CONFIG.DEFAULT_ORDER
-    local file  = next_file(folder, order)
-    if not file then
-        warn("No files in loop folder: " .. folder .. " — retrying in 2s")
-        mp.add_timeout(2.0, play_loop)
-        return
-    end
-
-    mp.set_property_bool("mute", CONFIG.LOOP_MUTED)
-    log("Loop clip: " .. file.name)
-    mp.commandv("loadfile", file.path, "replace")
+    return e
 end
 
--- play_cutscene: pick a clip from folder, set cutscene state, call on_done when it ends
-play_cutscene = function(folder, on_done)
-    local order = CONFIG.CUTSCENE_ORDER or "random"
-    local file  = next_file(folder, order)
-    if not file then
-        warn("No files in cutscene folder: " .. folder)
+local function ass_color(hex)
+    hex = tostring(hex or ""):gsub("^#", "")
+    if not hex:match("^%x%x%x%x%x%x$") then hex = "FFFFFF" end
+    return (hex:sub(5, 6) .. hex:sub(3, 4) .. hex:sub(1, 2)):upper()   -- RRGGBB -> BBGGRR
+end
+
+local function parse_text_file(path, name)
+    local f = io.open(path, "r")
+    if not f then return nil end
+    local content = f:read("*a") or ""
+    f:close()
+    content = content:gsub("\r", "")
+    local t = { kind = "text", name = name, position = "bottom-center", size = 48,
+                color = "FFFFFF", outline = 3, text = content }
+    if ("\n" .. content):lower():find("\ntext%s*:") then
+        local text_lines, in_text = {}, false
+        for line in (content .. "\n"):gmatch("(.-)\n") do
+            if in_text then
+                text_lines[#text_lines + 1] = line
+            else
+                local k, v = line:match("^%s*(%a+)%s*:%s*(.-)%s*$")
+                k = k and k:lower()
+                if k == "text" then in_text = true; if v ~= "" then text_lines[1] = v end
+                elseif k == "position" then t.position = v:lower()
+                elseif k == "size" then t.size = tonumber(v) or t.size
+                elseif k == "color" then t.color = v
+                elseif k == "outline" then t.outline = tonumber(v) or t.outline
+                end
+            end
+        end
+        t.text = table.concat(text_lines, "\n")
+    end
+    t.text = t.text:gsub("%s+$", "")
+    if t.text == "" then return nil end
+    return t
+end
+
+-- Contents of one overlay folder (scanned once, then cached)
+local function overlay_entries(folder)
+    if STATE.overlay_cache[folder] then return STATE.overlay_cache[folder] end
+    local list = { images = {}, texts = {} }
+    local names = utils.readdir(folder, "files") or {}
+    local items = {}
+    for _, name in ipairs(names) do
+        if name:sub(1, 1) ~= "." then
+            items[#items + 1] = { name = name, number = tonumber(name:match("^(%d+)")) }
+        end
+    end
+    table.sort(items, file_less)
+    for _, it in ipairs(items) do
+        local ext = (it.name:match("%.([^%.]+)$") or ""):lower()
+        local path = join(folder, it.name)
+        if ext == "png" or ext == "webp" then
+            if path:find("[']") then
+                warn_once("ovq" .. path, "Overlay skipped (the name contains an apostrophe): " .. path)
+            else
+                local e = parse_image_tags(it.name)
+                e.kind, e.path, e.name = "image", path, it.name
+                list.images[#list.images + 1] = e
+            end
+        elseif ext == "txt" then
+            local t = parse_text_file(path, it.name)
+            if t then list.texts[#list.texts + 1] = t end
+        end
+    end
+    STATE.overlay_cache[folder] = list
+    return list
+end
+
+-- Which overlay folders apply right now?
+local function active_overlay_folders()
+    if not CONFIG.OVERLAYS then return {} end
+    if STATE.phase == "cutscene" and not CONFIG.OVERLAYS_ON_CUTSCENES then return {} end
+    local lp = STATE.current_loop
+    local md = (STATE.phase == "media") and STATE.current_media or nil
+    if lcfg(lp, "overlays") == false then return {} end
+    if md and mcfg(md, "overlays") == false then return {} end
+    local names = { "*", lp }
+    if md then names[#names + 1] = md; names[#names + 1] = lp .. md end
+    local out = {}
+    for _, n in ipairs(names) do
+        local p = MODES.overlay_dirs[n]
+        if p then out[#out + 1] = p end
+    end
+    return out
+end
+
+-- One lavfi graph that stacks all the pictures on the video ("in" -> "out").
+-- vw/vh = size of the video, so sizes can be worked out here (no scale2ref: its
+-- variable names differ between ffmpeg versions).
+local function build_graph(images, vw, vh)
+    if #images == 0 then return "" end
+    local parts = {}
+    local base = "in"
+    for i, im in ipairs(images) do
+        local chain = "movie='" .. im.path .. "',format=rgba"
+        if im.pct then
+            chain = chain .. string.format(",scale=%d:-1", math.max(2, math.floor(vw * im.pct / 100 + 0.5)))
+        elseif not im.pos_h then
+            chain = chain .. string.format(",scale=%d:%d", vw, vh)           -- a frame: whole picture
+        end
+        if im.opacity and im.opacity < 100 then
+            chain = chain .. ",colorchannelmixer=aa=" .. string.format("%.2f", im.opacity / 100)
+        end
+        parts[#parts + 1] = chain .. "[o" .. i .. "]"
+        local x, y = "0", "0"
+        if im.pos_h then
+            x = (im.pos_h == "l" and "W*0.03") or (im.pos_h == "c" and "(W-w)/2") or "W-w-W*0.03"
+            y = (im.pos_v == "t" and "W*0.03") or (im.pos_v == "m" and "(H-h)/2") or "H-h-W*0.03"
+        end
+        local out = (i == #images) and "out" or ("b" .. i)
+        parts[#parts + 1] = "[" .. base .. "][o" .. i .. "]overlay=x=" .. x .. ":y=" .. y .. "[" .. out .. "]"
+        base = out
+    end
+    return table.concat(parts, ";")
+end
+
+-- ASS text for all text overlays, faded together with the picture
+local function refresh_text()
+    local texts = STATE.texts
+    if #texts == 0 then
+        if STATE.text_ov and STATE.text_last ~= "" then STATE.text_ov:remove(); STATE.text_last = "" end
+        return
+    end
+    local vis = math.max(0, math.min(1, (100 + STATE.bright) / 100))
+    local alpha = string.format("%02X", math.floor((1 - vis) * 255 + 0.5))
+    local ev = {}
+    for _, t in ipairs(texts) do
+        local h, v = "c", "b"
+        for _, p in ipairs(OVERLAY_POS) do if p[1] == t.position then h, v = p[2], p[3] end end
+        local x = (h == "l" and 60) or (h == "c" and 960) or 1860
+        local y = (v == "t" and 60) or (v == "m" and 540) or 1020
+        local an = ((v == "b") and 0 or (v == "m") and 3 or 6) + ((h == "l") and 1 or (h == "c") and 2 or 3)
+        local txt = t.text:gsub("{", "\\{"):gsub("}", "\\}"):gsub("\n", "\\N")
+        ev[#ev + 1] = string.format("{\\an%d\\pos(%d,%d)\\fs%d\\bord%s\\1c&H%s&\\3c&H000000&\\alpha&H%s&}%s",
+                                    an, x, y, t.size, tostring(t.outline), ass_color(t.color), alpha, txt)
+    end
+    local data = table.concat(ev, "\n")
+    if data == STATE.text_last then return end
+    STATE.text_last = data
+    if not STATE.text_ov then
+        STATE.text_ov = mp.create_osd_overlay("ass-events")
+        STATE.text_ov.res_x, STATE.text_ov.res_y = 1920, 1080
+    end
+    STATE.text_ov.data = data
+    STATE.text_ov:update()
+end
+
+-- Work out the overlays for the current situation and apply them
+local function apply_overlays()
+    local images, texts = {}, {}
+    for _, folder in ipairs(active_overlay_folders()) do
+        local e = overlay_entries(folder)
+        for _, im in ipairs(e.images) do images[#images + 1] = im end
+        for _, t in ipairs(e.texts) do texts[#texts + 1] = t end
+    end
+    local graph = build_graph(images, STATE.vw, STATE.vh)
+    if graph ~= STATE.vf_graph then
+        STATE.vf_graph = graph
+        if graph == "" then
+            mp.set_property_native("vf", {})
+        else
+            debug_log("Overlay graph: " .. graph)
+            mp.set_property_native("vf", { { name = "lavfi", params = { graph = graph } } })
+        end
+    end
+    STATE.texts = texts
+    refresh_text()
+end
+
+
+-- ==============================================================================
+-- SECTION 9: FADE SYSTEM
+-- Fades by animating mpv's `brightness` (0 = normal, -100 = black).
+-- Every new brightness animation cancels the previous one, and every clip
+-- change carries a token, so a key press in the middle of a fade can never
+-- leave two fades fighting each other or load two clips.
+-- ==============================================================================
+
+local function set_bright(v)
+    v = math.max(-100, math.min(0, math.floor(v + 0.5)))
+    if v ~= STATE.bright then
+        STATE.bright = v
+        mp.set_property_number("brightness", v)
+        if #STATE.texts > 0 then refresh_text() end     -- text fades with the picture
+    end
+end
+
+-- Animate brightness to `to_val`. Starts from the CURRENT brightness.
+-- A newer animation silently cancels this one (on_done is then not called).
+local function animate_brightness(to_val, duration, on_done)
+    STATE.fade_id = STATE.fade_id + 1
+    local my = STATE.fade_id
+    local from_val = STATE.bright
+    if duration <= 0 or from_val == to_val then
+        set_bright(to_val)
         if on_done then on_done() end
         return
     end
-
-    log("Cutscene: " .. file.name)
-    STATE.in_cutscene   = true
-    STATE.phase         = "cutscene"
-    STATE.cutscene_done = on_done
-    mp.set_property_bool("mute", false)
-    mp.commandv("loadfile", file.path, "replace")
+    local steps    = math.max(1, math.floor(duration * CONFIG.FADE_FPS))
+    local interval = duration / steps
+    local count    = 0
+    local function step()
+        if STATE.fade_id ~= my then return end          -- cancelled
+        count = count + 1
+        if count >= steps then
+            set_bright(to_val)
+            if on_done then on_done() end
+        else
+            set_bright(from_val + (to_val - from_val) * count / steps)
+            mp.add_timeout(interval, step)
+        end
+    end
+    mp.add_timeout(interval, step)
 end
 
--- Loads the next clip for an *already active* media trigger. Does not touch
--- phase/counters/timer/trigger_key or check for an intro cutscene — used
--- both for a trigger's first clip and for every subsequent clip in a
--- multi-clip trigger, so those don't get reset or re-run mid-trigger.
-play_media_clip = function(media_id)
-    local folder = resolve_media_folder(media_id)
-    if not folder then
-        warn("No folder for media: " .. media_id)
-        return_to_loop()
-        return
+-- Fade out just before a clip ends by itself (driven by mpv's time-remaining)
+local function on_time_remaining(_, remaining)
+    if not (CONFIG.FADE_ENABLED and CONFIG.FADE_BEFORE_END) then return end
+    if type(remaining) ~= "number" then return end
+    if not STATE.playing or STATE.transitioning or STATE.end_faded then return end
+    if remaining > 0.05 and remaining <= CONFIG.FADE_OUT_DURATION then
+        STATE.end_faded = true
+        animate_brightness(-100, remaining, nil)
     end
-
-    local order = mcfg(media_id, "order") or CONFIG.DEFAULT_ORDER
-    local file  = next_file(folder, order)
-    if not file then
-        warn("No files for media: " .. media_id)
-        return_to_loop()
-        return
-    end
-
-    log("Media clip: " .. file.name .. " [" .. media_id .. "]")
-    mp.commandv("loadfile", file.path, "replace")
 end
 
--- Starts a brand-new media trigger: resets per-trigger state, arms the
--- optional seconds timer, then plays the first clip. Called once per
--- trigger (after any intro cutscene has finished) — never per-clip.
-start_media_trigger = function(media_id, trigger_key)
-    STATE.phase                = "media"
-    STATE.current_media        = media_id
-    STATE.clips_played         = 0
-    STATE.active_trigger_key   = trigger_key
-    STATE.in_cutscene          = false
-    STATE.media_seconds_active = false
 
+-- ==============================================================================
+-- SECTION 10: CLIP LOADER — the ONE place that calls loadfile
+--   playing clip:   fade out -> black hold -> load -> fade in
+--   nothing playing (clip already ended / startup): black -> hold -> load -> fade in
+-- ==============================================================================
+
+local function load_clip(path, muted)
+    STATE.token = STATE.token + 1
+    local my = STATE.token
+
+    local function go()
+        if STATE.token ~= my then return end            -- a newer transition took over
+        mp.set_property_bool("mute", muted)              -- audio switches exactly now
+        STATE.transitioning = false
+        STATE.end_faded     = false
+        STATE.playing       = true
+        apply_overlays()                                 -- overlays for what is about to play
+        mp.commandv("loadfile", path, "replace")
+        if CONFIG.FADE_ENABLED then
+            mp.add_timeout(0.05, function()              -- let mpv start decoding first
+                if STATE.token == my then
+                    animate_brightness(0, CONFIG.FADE_IN_DURATION, nil)
+                end
+            end)
+        end
+    end
+
+    local function after_dark()
+        if STATE.token ~= my then return end
+        local hold = CONFIG.FADE_BLACK_HOLD or 0
+        if hold > 0 then mp.add_timeout(hold, go) else go() end
+    end
+
+    if not CONFIG.FADE_ENABLED then
+        go()
+    elseif STATE.playing and STATE.bright > -99 then
+        STATE.transitioning = true                       -- old clip still on screen
+        animate_brightness(-100, CONFIG.FADE_OUT_DURATION, after_dark)
+    else
+        STATE.transitioning = STATE.playing              -- (faded already, or nothing playing)
+        animate_brightness(-100, 0, nil)                 -- instant black
+        after_dark()
+    end
+end
+
+
+-- ==============================================================================
+-- SECTION 11: PLAYBACK ENGINE
+-- ==============================================================================
+
+local play_loop, play_loop_clip, play_cutscene, start_media, play_media_clip, return_to_loop, switch_loop
+local stop_music, play_song
+
+local function kill_media_timer()
     if STATE.media_timer then
         STATE.media_timer:kill()
         STATE.media_timer = nil
     end
-
-    -- SECONDS_PER_TRIGGER takes precedence over CLIPS_PER_TRIGGER when both
-    -- are set: while this timer is armed, on_clip_end (SECTION 13) ignores
-    -- the clip-count limit entirely and just keeps playing clips until the
-    -- timer fires.
-    local seconds = mcfg(media_id, "seconds_per_trigger") or CONFIG.SECONDS_PER_TRIGGER
-    if seconds and seconds > 0 then
-        STATE.media_seconds_active = true
-        STATE.media_timer = mp.add_timeout(seconds, function()
-            log("Media timed out (" .. seconds .. "s)")
-            STATE.media_timer          = nil
-            STATE.media_seconds_active = false
-            return_to_loop()
-        end)
-    end
-
-    mp.set_property_bool("mute", false)
-    play_media_clip(media_id)
 end
 
-play_media = function(media_id, trigger_key)
-    local folder = resolve_media_folder(media_id)
+-- Load the next clip of the loop on screen (the visual loop during a music mode)
+play_loop_clip = function()
+    local loop_id = STATE.visual_loop or STATE.current_loop
+    local folder = resolve_loop_folder(loop_id)
     if not folder then
-        log("No folder for media: " .. media_id .. " — ignoring")
+        warn_once("noloop" .. loop_id, "No folder for loop " .. loop_id)
         return
     end
+    local file = next_file(folder, lcfg(loop_id, "order") or CONFIG.DEFAULT_ORDER)
+    if not file then
+        warn_once("empty" .. folder, "No playable files in " .. folder .. " (retrying every 2s)")
+        mp.add_timeout(2.0, function()
+            if (STATE.phase == "loop" or STATE.clip_kind == "loop") and not STATE.playing and not STATE.transitioning then
+                play_loop_clip()
+            end
+        end)
+        return
+    end
+    log("Loop clip:  " .. file.name .. "  [" .. loop_id .. "]")
+    STATE.clip_kind = "loop"
+    load_clip(file.path, CONFIG.LOOP_MUTED)
+end
 
-    -- Check for intro cutscene (skip if we are already inside a cutscene chain).
-    -- IMPORTANT: the callback below calls start_media_trigger(), not
-    -- play_media() itself — calling play_media() again here would re-check
-    -- (and replay) the intro forever, since STATE.in_cutscene is already
-    -- back to false by the time this callback runs.
-    local play_intro = mcfg(media_id, "cutscene_on_trigger")
-    if play_intro == nil then play_intro = CONFIG.CUTSCENE_ON_TRIGGER end
+-- Back to plain loop state (and a fresh loop clip)
+play_loop = function()
+    stop_music()
+    STATE.visual_loop        = nil
+    STATE.phase              = "loop"
+    STATE.current_media      = nil
+    STATE.clips_played       = 0
+    STATE.active_trigger_key = nil
+    kill_media_timer()
+    play_loop_clip()
+end
 
-    if play_intro and not STATE.in_cutscene then
+-- Play one cutscene clip, then run on_done()
+play_cutscene = function(folder, on_done)
+    local file = next_file(folder, CONFIG.CUTSCENE_ORDER or "random")
+    if not file then
+        if on_done then on_done() end
+        return
+    end
+    log("Cutscene:   " .. file.name)
+    STATE.phase         = "cutscene"
+    STATE.cutscene_done = on_done
+    STATE.clip_kind     = "cutscene"
+    load_clip(file.path, false)
+end
+
+-- Load the next clip of the active media mode
+play_media_clip = function()
+    local media_id = STATE.current_media
+    local folder   = media_id and resolve_media_folder(media_id)
+    local file     = folder and next_file(folder, mcfg(media_id, "order") or CONFIG.DEFAULT_ORDER)
+    if not file then
+        warn("No playable files for " .. tostring(media_id))
+        return_to_loop()
+        return
+    end
+    if file.audio and mcfg(media_id, "music") ~= false then
+        play_song(media_id, file)                         -- loop video stays, song on top
+        return
+    end
+    log("Media clip: " .. file.name .. "  [" .. media_id .. "]")
+    STATE.visual_loop = nil
+    STATE.clip_kind = "media"
+    load_clip(file.path, false)
+end
+
+
+-- ------------------------------------------------------------------------------
+-- SONGS
+-- Audio files (mp3 ...) in a media folder are SONGS: the loop video keeps playing,
+-- silently, and the song is played on top of it by a second, hidden mpv process.
+-- A folder may hold only songs, only videos, or a mix: each item picked from the
+-- folder is played its own way. clips_per_trigger counts items (songs AND videos).
+-- Set  music = false  for a mode to play audio files like videos instead.
+-- ------------------------------------------------------------------------------
+
+stop_music = function()
+    local m = STATE.music
+    if not m then return end
+    STATE.music = nil                          -- (the end-of-song callback now ignores itself)
+    if m.cmd then mp.abort_async_command(m.cmd) end
+end
+
+-- One item of the active media mode finished: count it, then go on or stop
+local function media_item_done()
+    STATE.clips_played = STATE.clips_played + 1
+    local max = mcfg(STATE.current_media, "clips_per_trigger") or 1
+    if max == 0 or STATE.clips_played < max then
+        play_media_clip()
+    else
+        log("Clip limit reached (" .. max .. ")")
+        return_to_loop()
+    end
+end
+
+play_song = function(media_id, file)
+    log("Song:       " .. file.name .. "  [" .. media_id .. "]")
+    STATE.music = { media_id = media_id }
+    local m = STATE.music
+
+    -- the picture behind the song: a special visual loop, or the normal loop video
+    local vl = mcfg(media_id, "visual_loop")
+    local new_visual = nil
+    if vl and MODES.loops[vl] then
+        if STATE.visual_loop ~= vl then new_visual = vl end
+        STATE.visual_loop = vl
+    elseif vl then
+        warn_once("novl" .. vl, "visual_loop " .. vl .. " has no folder; using the current loop")
+    end
+    apply_overlays()
+    if new_visual or STATE.clip_kind ~= "loop" or not STATE.playing then
+        play_loop_clip()
+    end
+
+    local args = { CONFIG.MPV_BINARY, "--no-config", "--load-scripts=no", "--no-video",
+                   "--no-terminal", "--idle=no", "--force-window=no", "--audio-display=no",
+                   "--volume=" .. tostring(CONFIG.MUSIC_VOLUME) }
+    local fade = CONFIG.MUSIC_FADE_IN or 0
+    if fade > 0 then args[#args + 1] = "--af=lavfi=[afade=t=in:st=0:d=" .. tostring(fade) .. "]" end
+    local dev = mp.get_property("audio-device")
+    if dev and dev ~= "" and dev ~= "auto" then args[#args + 1] = "--audio-device=" .. dev end
+    for _, a in ipairs(CONFIG.MUSIC_EXTRA_ARGS or {}) do args[#args + 1] = a end
+    args[#args + 1] = "--"
+    args[#args + 1] = file.path
+
+    m.cmd = mp.command_native_async({ name = "subprocess", args = args, playback_only = false },
+        function(success, result, err)
+            if STATE.music ~= m then return end                          -- stopped / replaced
+            m.cmd = nil
+            local failed = (not success) or (result and result.status ~= 0)
+            local function finished()
+                if STATE.music ~= m then return end
+                STATE.music = nil
+                media_item_done()
+            end
+            if failed then
+                warn("Could not play song " .. file.name .. " (is '" .. tostring(CONFIG.MPV_BINARY) .. "' installed?)")
+                mp.add_timeout(1.0, finished)            -- never spin on a folder of bad files
+            else
+                finished()
+            end
+        end)
+end
+
+-- Begin a media mode: optional Intro cutscene, then the media itself.
+-- skip_intro = true when called from the Intro's own callback.
+start_media = function(media_id, trigger_key, skip_intro)
+    local folder, is_override = resolve_media_folder(media_id)
+    if not folder then return end
+    kill_media_timer()                                    -- never let an old timer cut this one short
+    stop_music()                                          -- (interrupting a music mode)
+    STATE.visual_loop = nil
+
+    if not skip_intro and mcfg(media_id, "cutscene_on_trigger") then
         local cf = resolve_cutscene("Intro", STATE.current_loop, media_id)
         if cf then
-            play_cutscene(cf, function()
-                start_media_trigger(media_id, trigger_key)
-            end)
+            play_cutscene(cf, function() start_media(media_id, trigger_key, true) end)
             return
         end
     end
 
-    start_media_trigger(media_id, trigger_key)
+    log("Media mode: " .. media_id .. (is_override and "  (override " .. STATE.current_loop .. media_id .. ")" or ""))
+    STATE.phase              = "media"
+    STATE.current_media      = media_id
+    STATE.clips_played       = 0
+    STATE.active_trigger_key = trigger_key
+
+    local seconds = mcfg(media_id, "seconds_per_trigger") or 0
+    if seconds > 0 then
+        STATE.media_timer = mp.add_timeout(seconds, function()
+            STATE.media_timer = nil
+            if STATE.phase == "media" then
+                log("Media time limit reached (" .. seconds .. "s)")
+                return_to_loop()
+            end
+        end)
+    end
+    play_media_clip()
 end
 
+-- Media is over: apply anything the scheduler queued, else Outro, else loop
 return_to_loop = function()
-    -- Cancel any running seconds timer
-    if STATE.media_timer then
-        STATE.media_timer:kill()
-        STATE.media_timer = nil
-    end
-    STATE.media_seconds_active = false
+    kill_media_timer()
+    local had_visual = STATE.visual_loop ~= nil
+    stop_music()
+    STATE.visual_loop = nil
 
-    -- If scheduler posted a loop switch while media was playing, apply it now
     if STATE.pending_loop then
-        local new_loop = STATE.pending_loop
+        local nl = STATE.pending_loop
         STATE.pending_loop = nil
-        switch_loop(new_loop)
+        STATE.pending_media = nil
+        if switch_loop(nl) then return end      -- false = nothing to switch to; carry on below
+    end
+    if STATE.pending_media then
+        local pm = STATE.pending_media
+        STATE.pending_media = nil
+        start_media(pm, nil)
         return
     end
 
-    -- Check for outro cutscene
-    local media_id   = STATE.current_media
-    local play_outro = mcfg(media_id, "cutscene_on_return")
-    if play_outro == nil then play_outro = CONFIG.CUTSCENE_ON_RETURN end
-
-    if play_outro and media_id then
+    local media_id = STATE.current_media
+    if media_id and mcfg(media_id, "cutscene_on_return") then
         local cf = resolve_cutscene("Outro", STATE.current_loop, media_id)
         if cf then
             play_cutscene(cf, function() play_loop() end)
             return
         end
     end
-
+    if not had_visual and STATE.clip_kind == "loop" and STATE.playing then
+        -- the last song ended while the normal loop video was on screen: carry on, no reload
+        STATE.phase, STATE.current_media = "loop", nil
+        STATE.clips_played, STATE.active_trigger_key = 0, nil
+        apply_overlays()
+        return
+    end
     play_loop()
 end
 
-switch_loop = function(new_loop_id)
-    if new_loop_id == STATE.current_loop then
-        log("Loop switch ignored — already on " .. new_loop_id)
-        return
+-- Returns true if it started playing something, false if there was nothing to do
+-- (same loop, or the folder does not exist) so callers can carry on themselves.
+switch_loop = function(new_loop)
+    if new_loop == STATE.current_loop then return false end
+    if not MODES.loops[new_loop] then
+        warn_once("noloop" .. new_loop, "Cannot switch to " .. new_loop .. ": no such loop folder")
+        return false
     end
-    -- If the target loop folder does not exist, stay on current loop
-    if not MODES.loops[new_loop_id] then
-        warn("Loop switch aborted — no folder for: " .. new_loop_id .. " (staying on " .. STATE.current_loop .. ")")
-        return
-    end
-    log("Switching loop: " .. STATE.current_loop .. " → " .. new_loop_id)
-
-    local play_trans = lcfg(new_loop_id, "cutscene_on_switch")
-    if play_trans == nil then play_trans = CONFIG.CUTSCENE_ON_SWITCH end
-
-    STATE.current_loop  = new_loop_id
+    log("Loop switch: " .. STATE.current_loop .. " -> " .. new_loop)
+    STATE.current_loop  = new_loop
     STATE.current_media = nil
-    STATE.phase         = "loop"
+    kill_media_timer()
+    stop_music()
+    STATE.visual_loop = nil
 
-    if play_trans then
-        local cf = resolve_cutscene("Transition", new_loop_id, nil)
+    if lcfg(new_loop, "cutscene_on_switch") then
+        local cf = resolve_cutscene("Transition", new_loop, nil)
         if cf then
             play_cutscene(cf, function() play_loop() end)
-            return
+            return true
         end
     end
-
     play_loop()
+    return true
 end
 
 
 -- ==============================================================================
--- SECTION 13: CLIP END HANDLER
--- Called by MPV every time a file finishes. Drives the state machine forward.
+-- SECTION 12: CLIP-END HANDLER
+-- mpv sends end-file with reason "stop" every time WE replace a clip, so only
+-- "eof" (finished by itself) and "error" (unplayable file) mean "next, please".
 -- ==============================================================================
 
-local function on_clip_end(event)
-    -- Log every end-file event so we can see exactly what mpv is reporting
-    log("end-file: reason=" .. tostring(event.reason) ..
-        " phase=" .. tostring(STATE.phase) ..
-        " in_cutscene=" .. tostring(STATE.in_cutscene))
-
-    -- "replace" fires when we call loadfile() to load the next file.
-    -- "quit" fires on mpv exit. Both must be ignored or they corrupt state.
-    if event.reason == "replace" or event.reason == "quit" then return end
-
-    -- Cutscene just finished — fire its callback.
-    -- Check both in_cutscene flag AND phase so either catches it.
-    if STATE.in_cutscene or STATE.phase == "cutscene" then
-        log("Cutscene end fired — calling callback")
-        STATE.in_cutscene = false
-        STATE.phase       = "loop"  -- safe default; callback will set correct phase
+local function on_clip_finished()
+    if STATE.phase == "cutscene" then
         local done = STATE.cutscene_done
         STATE.cutscene_done = nil
-        if done then done() end
-        return
-    end
+        if done then done() else play_loop() end
 
-    -- Media mode: decide whether to play another clip or return to loop
-    if STATE.phase == "media" then
-        local media_id = STATE.current_media
+    elseif STATE.phase == "media" and STATE.clip_kind == "loop" then
+        play_loop_clip()                       -- the loop video behind a song ended; the song plays on
 
-        STATE.clips_played = STATE.clips_played + 1
+    elseif STATE.phase == "media" then
+        media_item_done()
 
-        -- SECONDS_PER_TRIGGER takes precedence: while its timer is armed,
-        -- ignore the clip-count limit entirely and just keep playing clips
-        -- until the timer fires (see start_media_trigger, SECTION 12).
-        if STATE.media_seconds_active then
-            play_media_clip(media_id)
-            return
-        end
-
-        local clips_max = mcfg(media_id, "clips_per_trigger") or CONFIG.CLIPS_PER_TRIGGER
-
-        -- 0 = play indefinitely (until timer or interrupt)
-        if clips_max == 0 then
-            play_media_clip(media_id)
-            return
-        end
-
-        if STATE.clips_played < clips_max then
-            play_media_clip(media_id)
-            return
-        end
-
-        log("Clip limit reached (" .. clips_max .. ") — returning to loop")
-        return_to_loop()
-        return
-    end
-
-    -- Loop mode: check for deferred scheduler events, then play next loop clip
-    if STATE.phase == "loop" then
+    else  -- loop
         if STATE.pending_loop then
-            local new_loop = STATE.pending_loop
+            local nl = STATE.pending_loop
             STATE.pending_loop = nil
-            switch_loop(new_loop)
-            return
-        end
-        if STATE.pending_media then
-            local mid = STATE.pending_media
+            if not switch_loop(nl) then play_loop() end
+        elseif STATE.pending_media then
+            local pm = STATE.pending_media
             STATE.pending_media = nil
-            play_media(mid, nil)
-            return
+            start_media(pm, nil)
+        else
+            play_loop()
         end
-        play_loop()
-        return
     end
 end
 
-mp.register_event("end-file", on_clip_end)
+local function on_end_file(ev)
+    debug_log("end-file reason=" .. tostring(ev.reason) .. " phase=" .. STATE.phase ..
+              " playing=" .. tostring(STATE.playing) .. " transitioning=" .. tostring(STATE.transitioning))
+    local reason = ev.reason
+    if reason ~= "eof" and reason ~= "error" then return end   -- our own replace, quit, etc.
+    if not STATE.playing then return end                       -- stray event
+    STATE.playing = false
+    if STATE.transitioning then return end                     -- old clip ended mid-fade; load continues
+    if reason == "error" then
+        -- Unplayable file: wait a second so a folder of bad files cannot spin the CPU
+        warn("Could not play the last clip; moving on")
+        local my = STATE.token
+        mp.add_timeout(1.0, function()
+            if STATE.token == my and not STATE.playing and not STATE.transitioning then on_clip_finished() end
+        end)
+        return
+    end
+    on_clip_finished()
+end
 
 
 -- ==============================================================================
--- SECTION 14: KEY HANDLERS
+-- SECTION 13: KEY HANDLERS
 -- ==============================================================================
 
-handle_media_key = function(media_id, trigger_key)
-    -- Always ignore keypresses during a cutscene
-    if STATE.in_cutscene then
-        log("Key ignored (in cutscene)")
-        return
-    end
-
-    -- No matching folder — silently ignore
-    if not MODES.media[media_id] and not MODES.overrides[STATE.current_loop .. media_id] then
-        return
-    end
+local function handle_media_key(media_id, trigger_key)
+    if STATE.phase == "cutscene" then return end                 -- keys ignored during cutscenes
+    if not resolve_media_folder(media_id) then return end        -- no folder -> silently ignored
 
     if STATE.phase == "media" then
-        local active_id  = STATE.current_media
-        local lock       = mcfg(active_id, "lock_keys")
-        if lock == nil then lock = CONFIG.LOCK_KEYS end
+        local active = STATE.current_media
+        if mcfg(active, "lock_keys") then return end             -- locked: ignore everything
 
-        -- Lock mode: ignore all keys while media plays
-        if lock then
-            log("Key ignored (lock_keys on " .. active_id .. ")")
-            return
-        end
-
-        -- Same key pressed again
-        if trigger_key == STATE.active_trigger_key then
-            local cancel = mcfg(active_id, "key_cancel")
-            if cancel == nil then cancel = CONFIG.KEY_CANCEL end
-            if cancel then
-                log("Same key — cancelling " .. active_id)
+        if trigger_key == STATE.active_trigger_key then          -- same key again
+            if mcfg(active, "key_cancel") then
+                log("Same key pressed: cancelling " .. active)
                 return_to_loop()
-            else
-                log("Same key — ignored (key_cancel off)")
             end
             return
         end
-
-        -- Different key: interrupt current media immediately
-        log("Interrupting " .. active_id .. " → " .. media_id)
-        if STATE.media_timer then
-            STATE.media_timer:kill()
-            STATE.media_timer = nil
-        end
-        play_media(media_id, trigger_key)
-        return
+        log("Interrupting " .. active .. " with " .. media_id)
     end
-
-    -- Loop mode: trigger media normally
-    play_media(media_id, trigger_key)
+    STATE.pending_media = nil
+    start_media(media_id, trigger_key)
 end
 
-handle_loop_key = function(loop_id)
-    if STATE.in_cutscene then
-        log("Loop key ignored (in cutscene)")
-        return
-    end
-    -- Already on this loop — do nothing
-    if loop_id == STATE.current_loop then
-        log("Loop key ignored — already on " .. loop_id)
-        return
-    end
-    -- Interrupt media if playing, then switch loop
-    if STATE.media_timer then
-        STATE.media_timer:kill()
-        STATE.media_timer = nil
-    end
+local function handle_loop_key(loop_id)
+    if STATE.phase == "cutscene" then return end
+    if loop_id == STATE.current_loop then return end             -- already on it
+    STATE.pending_loop, STATE.pending_media = nil, nil           -- a manual choice wins
     switch_loop(loop_id)
+end
+
+local function register_keybinds()
+    -- Media keys: the character after the M. Override-only modes count too.
+    local media_ids = {}
+    for id in pairs(MODES.media) do media_ids[id] = true end
+    for _, ov in pairs(MODES.overrides) do media_ids[ov.media_id] = true end
+    for media_id in pairs(media_ids) do
+        local key = media_id:sub(2)
+        local mid = media_id
+        -- (forced bindings: they keep working with --no-input-default-bindings, which switches
+        --  off mpv's own keys such as q / f / space. Normal bindings would be switched off too.)
+        mp.add_forced_key_binding(key, "media_" .. mid, function() handle_media_key(mid, key) end)
+        log("Key [" .. key .. "] -> " .. mid)
+    end
+
+    -- Loop keys: L0 = ESC, L1..L12 = F1..F12
+    for loop_id, info in pairs(MODES.loops) do
+        local lid = loop_id
+        local key
+        if info.num == 0 then key = "ESC"
+        elseif info.num <= 12 then key = "F" .. info.num
+        else warn(loop_id .. " has no F-key (only up to L12); the scheduler can still use it") end
+        if key then
+            mp.add_forced_key_binding(key, "loop_" .. lid, function() handle_loop_key(lid) end)
+            log("Key [" .. key .. "] -> " .. lid)
+        end
+    end
+
+    if CONFIG.QUIT_KEY and CONFIG.QUIT_KEY ~= "" then
+        mp.add_forced_key_binding(CONFIG.QUIT_KEY, "sm_quit", function() mp.command("quit") end)
+    end
 end
 
 
 -- ==============================================================================
--- SECTION 15: SCHEDULER
--- Reads schedule.cfg. File line order = priority (bottom line = highest).
--- Evaluates on each tick; highest-priority matching loop event wins.
--- Media events fire once per minute at their scheduled time.
+-- SECTION 14: SCHEDULER
 --
--- SCHEDULE.CFG FORMAT:
---   # comment lines start with #
---   loop   L1   08:00   22:00    (active during window; overnight wraps work)
---   media  M2   12:00            (one-shot trigger at this time each day)
+--   schedule.cfg (one entry per line, "#" = comment):
+--     loop   L1  START END [FROM-DATE TO-DATE]     e.g.  loop L1 08:00 22:00 12-01 01-06
+--     media  M2  TIME      [FROM-DATE TO-DATE]     e.g.  media M2 12:00
+--   Times are HH:MM (24h). Dates are MM-DD, yearly, and may wrap New Year.
+--   Lines lower in the file have HIGHER priority when entries overlap.
 --
--- Lower in the file = higher priority. On conflict, last matching entry wins.
+-- The scheduler only acts when the loop it WANTS changes. A manual F-key press
+-- therefore stays in effect until the schedule's wish changes again.
 -- ==============================================================================
 
 local function parse_hhmm(str)
     if not str then return nil end
-    local h, m = str:match("^(%d+):(%d+)$")
-    if h and m then return tonumber(h) * 60 + tonumber(m) end
+    local h, m = str:match("^(%d%d?):(%d%d)$")
+    if h then return tonumber(h) * 60 + tonumber(m) end
     return nil
 end
 
-local function minutes_now()
-    local t = os.date("*t")
-    return t.hour * 60 + t.min
+local function parse_mmdd(str)
+    if not str then return nil end
+    local m, d = str:match("^(%d%d?)%-(%d%d?)$")
+    if m then return tonumber(m) * 100 + tonumber(d) end
+    return nil
+end
+
+local function date_active(ev, month, day)
+    if not ev.from_date then return true end
+    local v = month * 100 + day
+    if ev.from_date <= ev.to_date then
+        return v >= ev.from_date and v <= ev.to_date
+    end
+    return v >= ev.from_date or v <= ev.to_date          -- wraps over New Year
 end
 
 local function load_schedule()
     STATE.schedule_layers = {}
     if not path_exists(PATHS.SCHEDULE) then
-        log("No schedule file: " .. PATHS.SCHEDULE)
+        log("No schedule file (" .. PATHS.SCHEDULE .. ") - running without a schedule")
         return
     end
-
     local f = io.open(PATHS.SCHEDULE, "r")
-    if not f then
-        warn("Cannot open schedule: " .. PATHS.SCHEDULE)
-        return
-    end
+    if not f then warn("Cannot open " .. PATHS.SCHEDULE); return end
 
     local line_num = 0
     for line in f:lines() do
         line_num = line_num + 1
-        line = line:match("^%s*(.-)%s*$")
-        if line ~= "" and not line:match("^#") then
-            local parts = {}
-            for p in line:gmatch("%S+") do table.insert(parts, p) end
+        line = line:gsub("\r", ""):match("^%s*(.-)%s*$")
+        if line ~= "" and line:sub(1, 1) ~= "#" then
+            local p = {}
+            for w in line:gmatch("%S+") do p[#p + 1] = w end
+            local etype, eid = p[1] and p[1]:lower(), p[2]
+            local ev
 
-            if #parts >= 3 then
-                local etype     = parts[1]:lower()
-                local eid       = parts[2]
-                local start_min = parse_hhmm(parts[3])
-                local end_min   = parts[4] and parse_hhmm(parts[4]) or nil
+            if etype == "loop" and #p >= 4 then
+                ev = { type = "loop", id = eid, start_min = parse_hhmm(p[3]), end_min = parse_hhmm(p[4]),
+                       dates = { p[5], p[6] } }
+                if not (ev.start_min and ev.end_min) then ev = nil end
+            elseif etype == "media" and #p >= 3 then
+                ev = { type = "media", id = eid, start_min = parse_hhmm(p[3]), dates = { p[4], p[5] },
+                       fired = false, last_min = -1 }
+                if not ev.start_min then ev = nil end
+            end
 
-                if not start_min then
-                    warn("Schedule line " .. line_num .. ": bad start time '" .. parts[3] .. "' — skipping")
-                elseif etype ~= "loop" and etype ~= "media" then
-                    warn("Schedule line " .. line_num .. ": unknown event type '" .. parts[1] .. "' — skipping")
-                elseif etype == "loop" and not end_min then
-                    warn("Schedule line " .. line_num .. ": 'loop' entries need an end time " ..
-                         "(loop ID START END) — skipping")
-                else
-                    table.insert(STATE.schedule_layers, {
-                        type      = etype,
-                        id        = eid,
-                        start_min = start_min,
-                        end_min   = end_min,
-                        fired     = false,
-                        _last_min = -1,
-                    })
-                    log("Schedule [line " .. line_num .. "]: " .. etype .. " " .. eid)
-                end
+            if ev and (ev.dates[1] or ev.dates[2]) then
+                ev.from_date, ev.to_date = parse_mmdd(ev.dates[1]), parse_mmdd(ev.dates[2])
+                if not (ev.from_date and ev.to_date) then ev = nil end
+            end
+
+            if ev then
+                STATE.schedule_layers[#STATE.schedule_layers + 1] = ev
+                log("Schedule line " .. line_num .. ": " .. line)
             else
-                warn("Schedule line " .. line_num .. ": expected at least 3 fields (type id time) — skipping")
+                warn("Ignoring schedule line " .. line_num .. ": " .. line)
             end
         end
     end
@@ -1130,134 +1279,118 @@ local function load_schedule()
     log("Schedule loaded: " .. #STATE.schedule_layers .. " entries")
 end
 
-local function evaluate_schedule()
-    local now_min = minutes_now()
-
-    -- Walk all layers in file order (lowest priority first).
-    -- For loop events, each matching entry overwrites the previous candidate —
-    -- so the last (highest priority) match is what we end up with.
-    local winning_loop  = nil
-    local media_fires   = {}
-
+-- Which loop does the schedule want right now, and which media fire this minute?
+local function compute_schedule(t)
+    local now_min = t.hour * 60 + t.min
+    local winning, fires = nil, {}
     for _, ev in ipairs(STATE.schedule_layers) do
-        if ev.type == "loop" and ev.end_min then
-            local active
-            if ev.start_min <= ev.end_min then
-                active = now_min >= ev.start_min and now_min < ev.end_min
+        if date_active(ev, t.month, t.day) then
+            if ev.type == "loop" then
+                local active
+                if ev.start_min <= ev.end_min then
+                    active = now_min >= ev.start_min and now_min < ev.end_min
+                else
+                    active = now_min >= ev.start_min or now_min < ev.end_min   -- overnight
+                end
+                if active then winning = ev.id end        -- later lines overwrite earlier ones
             else
-                -- Overnight window e.g. 22:00–06:00
-                active = now_min >= ev.start_min or now_min < ev.end_min
-            end
-            if active then
-                winning_loop = ev.id   -- later entry overwrites earlier
-            end
-
-        elseif ev.type == "media" then
-            -- Reset one-shot flag each new minute
-            if now_min ~= ev._last_min then
-                ev._last_min = now_min
-                ev.fired     = false
-            end
-            if now_min == ev.start_min and not ev.fired then
-                ev.fired = true
-                table.insert(media_fires, ev.id)
+                if now_min ~= ev.last_min then ev.last_min, ev.fired = now_min, false end
+                if now_min == ev.start_min and not ev.fired then
+                    ev.fired = true
+                    fires[#fires + 1] = ev.id
+                end
             end
         end
     end
+    return winning, fires
+end
 
-    -- No matching loop event → fall back to default
-    local target_loop = winning_loop or CONFIG.DEFAULT_LOOP
-
-    -- Apply loop switch if needed
-    if target_loop ~= STATE.current_loop then
-        if STATE.phase == "media" or STATE.in_cutscene then
-            -- Defer: switch after current clip ends
-            if STATE.pending_loop ~= target_loop then
-                log("Scheduler: pending loop → " .. target_loop)
-                STATE.pending_loop = target_loop
-            end
-        else
-            switch_loop(target_loop)
+local function request_loop(target)
+    if target == STATE.current_loop then
+        STATE.pending_loop = nil
+    elseif STATE.phase == "media" or STATE.phase == "cutscene" then
+        if STATE.pending_loop ~= target then
+            log("Scheduler: " .. target .. " queued until the current media ends")
+            STATE.pending_loop = target
         end
-    end
-
-    -- Apply media triggers (defer if busy)
-    for _, mid in ipairs(media_fires) do
-        log("Scheduler: trigger " .. mid)
-        if STATE.phase == "media" or STATE.in_cutscene then
-            STATE.pending_media = mid
-        else
-            play_media(mid, nil)
-        end
+    else
+        switch_loop(target)
     end
 end
 
-local function start_scheduler()
-    mp.add_periodic_timer(CONFIG.TICK_INTERVAL, function()
-        evaluate_schedule()
-    end)
-    log("Scheduler running (tick=" .. CONFIG.TICK_INTERVAL .. "s)")
+local function evaluate_schedule()
+    local winning, fires = compute_schedule(os.date("*t"))
+    local target = winning or CONFIG.DEFAULT_LOOP
+    if target ~= STATE.sched_loop then
+        STATE.sched_loop = target
+        request_loop(target)
+    end
+    for _, mid in ipairs(fires) do
+        if resolve_media_folder(mid) then
+            log("Scheduler: trigger " .. mid)
+            if STATE.phase == "media" or STATE.phase == "cutscene" then
+                STATE.pending_media = mid
+            else
+                start_media(mid, nil)
+            end
+        else
+            warn_once("nomedia" .. mid, "Scheduled media " .. mid .. " has no folder")
+        end
+    end
 end
 
 
 -- ==============================================================================
--- SECTION 16: INITIALISATION
--- Runs once after MPV is ready. Scans folders, registers keys, starts scheduler.
+-- SECTION 15: STARTUP
 -- ==============================================================================
 
 local function init()
-    log("MPV State Machine starting...")
+    if STATE._initialised then return end
+    STATE._initialised = true
+    log("Starting up")
     math.randomseed(os.time())
+    math.random(); math.random(); math.random()
 
-    -- Load external config.cfg first — everything downstream (scheduler tick
-    -- rate, default loop, per-mode overrides) should see the final values.
-    load_config()
-    STATE.current_loop = CONFIG.DEFAULT_LOOP  -- re-sync: STATE was built before config.cfg was read
-
-    -- MPV options for unattended kiosk playback
+    mp.set_property("keep-open",     "no")        -- let mpv report eof
     mp.set_property("loop-file",     "no")
     mp.set_property("loop-playlist", "no")
-    -- keep-open=no is critical: allows end-file to fire when a clip finishes.
-    -- keep-open=yes causes mpv to pause on the last frame instead of firing
-    -- the end-file event, which breaks the state machine entirely.
-    mp.set_property("keep-open",     "no")
     mp.set_property("idle",          "yes")
+    mp.set_property("force-window",  "yes")       -- keep the (black) window while between clips
+    mp.set_property_number("brightness", 0)
+    STATE.bright = 0
 
-    -- Scan root folder to discover all L, M, and override folders
+    load_config()
     scan_root()
-
-    -- Auto-register keybinds from discovered folders
     register_keybinds()
-
-    -- Load and start the scheduler
     load_schedule()
-    start_scheduler()
 
-    -- Verify the default loop exists
-    if not MODES.loops[CONFIG.DEFAULT_LOOP] then
-        warn("Default loop folder not found: " .. CONFIG.DEFAULT_LOOP ..
-             " — create a folder named '" .. CONFIG.DEFAULT_LOOP ..
-             "' in " .. PATHS.ROOT)
+    -- Start directly in the loop the schedule wants (no flash of the default loop)
+    local winning = compute_schedule(os.date("*t"))
+    local wanted  = winning or CONFIG.DEFAULT_LOOP
+    STATE.sched_loop   = wanted
+    STATE.current_loop = MODES.loops[wanted] and wanted or CONFIG.DEFAULT_LOOP
+    if not MODES.loops[STATE.current_loop] then
+        warn("Default loop folder '" .. CONFIG.DEFAULT_LOOP .. "' not found in " .. PATHS.ROOT)
     end
 
-    -- Start playback
-    log("Starting loop: " .. CONFIG.DEFAULT_LOOP)
-    play_loop()
+    mp.register_event("end-file", on_end_file)
+    mp.observe_property("time-remaining", "number", on_time_remaining)
 
-    log("Ready.")
+    -- Overlay sizes depend on the video size: rebuild them if a clip has another size
+    local function on_video_size()
+        local w = mp.get_property_number("video-params/w")
+        local h = mp.get_property_number("video-params/h")
+        if w and h and w > 0 and h > 0 and (w ~= STATE.vw or h ~= STATE.vh) then
+            STATE.vw, STATE.vh = w, h
+            if STATE.vf_graph ~= "" then apply_overlays() end
+        end
+    end
+    mp.observe_property("video-params/w", "number", on_video_size)
+    mp.observe_property("video-params/h", "number", on_video_size)
+
+    mp.add_periodic_timer(CONFIG.TICK_INTERVAL, evaluate_schedule)
+    play_loop()
+    log("Ready")
 end
 
--- Start once MPV is idle (handles both cold start and --idle launch)
-mp.register_event("idle", function()
-    if not STATE._initialised then
-        STATE._initialised = true
-        mp.add_timeout(0.1, init)
-    end
-end)
-
-mp.register_event("start-file", function()
-    if not STATE._initialised then
-        STATE._initialised = true
-        mp.add_timeout(0.1, init)
-    end
-end)
+mp.add_timeout(0.1, init)
